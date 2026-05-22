@@ -190,6 +190,8 @@ class WorkflowManager:
 
         for pattern in _TEMPLATE_PATTERNS:
             rendered = pattern.sub(replace, rendered)
+        if any(pattern.search(rendered) for pattern in _TEMPLATE_PATTERNS):
+            missing.add("__rendered_template__")
         return rendered
 
 # 2019-03-27T19:58:07 update

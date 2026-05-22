@@ -89,6 +89,38 @@ def test_runtime_parameters_are_rendered_and_passed_to_handler():
     }
 
 
+def test_rendered_template_values_are_rejected_before_execution(caplog):
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("deploy")
+    calls = []
+
+    def deploy(**kwargs):
+        calls.append(kwargs)
+
+    step = WorkflowStep(
+        "deploy-prod",
+        deploy,
+        parameters={"environment": "${environment}"},
+    )
+    workflow.add_step(step)
+
+    caplog.set_level(logging.WARNING, logger="src.orchestrator.workflow")
+
+    result = manager.execute_workflow(
+        workflow.id,
+        {"environment": "{{ secret_environment }}"},
+    )
+
+    assert result is False
+    assert calls == []
+    assert workflow.status is StepStatus.PENDING
+    assert step.status is StepStatus.PENDING
+    assert workflow.error == ERROR
+    assert step.error == ERROR
+    assert ERROR in caplog.text
+    assert "secret_environment" not in caplog.text
+
+
 def test_no_parameter_workflow_remains_compatible():
     manager = WorkflowManager()
     workflow = manager.create_workflow("maintenance")
