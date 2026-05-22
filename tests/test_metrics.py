@@ -1,5 +1,5 @@
 import pytest
-from src.common.metrics import MetricsCollector
+from src.common.metrics import AnalyticsAnonymityError, MetricsCollector
 
 
 class TestMetricsCollector:
@@ -30,6 +30,55 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_analytics_publish_blocks_small_histogram_groups(self):
+        self.metrics.observe("task.duration", 0.2)
+        self.metrics.observe("task.duration", 0.4)
+
+        with pytest.raises(AnalyticsAnonymityError) as exc_info:
+            self.metrics.analytics_publish_snapshot(minimum_group_size=3)
+
+        assert exc_info.value.minimum_group_size == 3
+        assert exc_info.value.suppressed_groups == [
+            {
+                "metric": "task.duration",
+                "type": "histogram",
+                "count": 2,
+                "reason": "below_minimum_group_size",
+            }
+        ]
+        assert "0.2" not in str(exc_info.value.suppressed_groups)
+        assert "0.4" not in str(exc_info.value.suppressed_groups)
+
+    def test_analytics_publish_allows_boundary_group_size(self):
+        for value in (0.2, 0.4, 0.6):
+            self.metrics.observe("task.duration", value)
+
+        snapshot = self.metrics.analytics_publish_snapshot(
+            minimum_group_size=3,
+        )
+
+        assert snapshot["histograms"]["task.duration"]["count"] == 3
+        assert snapshot["histograms"]["task.duration"]["avg"] == pytest.approx(
+            0.4,
+        )
+        assert snapshot["anonymity"] == {
+            "minimum_group_size": 3,
+            "suppressed_groups": [],
+        }
+
+    def test_analytics_publish_allows_large_groups(self):
+        for value in (0.1, 0.2, 0.3, 0.4, 0.5):
+            self.metrics.observe("task.duration", value)
+
+        snapshot = self.metrics.analytics_publish_snapshot(
+            minimum_group_size=3,
+        )
+
+        assert snapshot["histograms"]["task.duration"]["count"] == 5
+        assert snapshot["histograms"]["task.duration"]["sum"] == pytest.approx(
+            1.5,
+        )
 
 # 2019-07-16T09:29:21 update
 

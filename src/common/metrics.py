@@ -1,9 +1,26 @@
 """Metrics collection and reporting."""
 
+from threading import Lock
 import time
 from collections import defaultdict
-from typing import Dict, List
-from threading import Lock
+from typing import Any, Dict, List
+
+
+class AnalyticsAnonymityError(ValueError):
+    """Raised when a publish snapshot would expose an undersized group."""
+
+    def __init__(
+        self,
+        suppressed_groups: List[Dict[str, Any]],
+        minimum_group_size: int,
+    ):
+        self.suppressed_groups = suppressed_groups
+        self.minimum_group_size = minimum_group_size
+        super().__init__(
+            "analytics publish blocked: "
+            f"{len(suppressed_groups)} metric group(s) below minimum size "
+            f"{minimum_group_size}"
+        )
 
 
 class MetricsCollector:
@@ -34,17 +51,69 @@ class MetricsCollector:
         with self._lock:
             if metric in self._timers:
                 duration = time.time() - self._timers.pop(metric)
-                self.observe(metric, duration)
+                self._histograms[metric].append(duration)
                 return duration
         return 0.0
 
     def snapshot(self) -> Dict:
         with self._lock:
+            histograms = {
+                k: {
+                    "count": len(v),
+                    "sum": sum(v),
+                    "avg": sum(v) / len(v) if v else 0,
+                }
+                for k, v in self._histograms.items()
+            }
             return {
                 "counters": dict(self._counters),
                 "gauges": dict(self._gauges),
-                "histograms": {k: {"count": len(v), "sum": sum(v), "avg": sum(v) / len(v) if v else 0}
-                               for k, v in self._histograms.items()},
+                "histograms": histograms,
+            }
+
+    def analytics_publish_snapshot(self, minimum_group_size: int = 5) -> Dict:
+        """Return a publishable snapshot when groups meet anonymity rules."""
+        if not isinstance(minimum_group_size, int) or isinstance(
+            minimum_group_size,
+            bool,
+        ):
+            raise ValueError("minimum_group_size must be an integer")
+        if minimum_group_size < 1:
+            raise ValueError("minimum_group_size must be at least 1")
+
+        with self._lock:
+            suppressed_groups = [
+                {
+                    "metric": name,
+                    "type": "histogram",
+                    "count": len(values),
+                    "reason": "below_minimum_group_size",
+                }
+                for name, values in self._histograms.items()
+                if 0 < len(values) < minimum_group_size
+            ]
+            if suppressed_groups:
+                raise AnalyticsAnonymityError(
+                    suppressed_groups,
+                    minimum_group_size,
+                )
+
+            histograms = {
+                k: {
+                    "count": len(v),
+                    "sum": sum(v),
+                    "avg": sum(v) / len(v) if v else 0,
+                }
+                for k, v in self._histograms.items()
+            }
+            return {
+                "counters": dict(self._counters),
+                "gauges": dict(self._gauges),
+                "histograms": histograms,
+                "anonymity": {
+                    "minimum_group_size": minimum_group_size,
+                    "suppressed_groups": [],
+                },
             }
 
 
