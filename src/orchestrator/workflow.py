@@ -1,8 +1,20 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
+import re
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
+_UNRESOLVED_TEMPLATE_ERROR = (
+    "unresolved template variables in workflow parameters"
+)
+_TEMPLATE_PATTERNS = (
+    re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}\}"),
+    re.compile(r"\$\{\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\}"),
+)
 
 
 class StepStatus(Enum):
@@ -14,12 +26,20 @@ class StepStatus(Enum):
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameters: Optional[Dict[str, Any]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameters = dict(parameters or {})
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
@@ -33,6 +53,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.error: Optional[str] = None
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -61,26 +82,115 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
-    def execute_workflow(self, workflow_id: str) -> bool:
+    def execute_workflow(
+        self,
+        workflow_id: str,
+        runtime_parameters: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
 
+        bound_parameters: Dict[str, Dict[str, Any]] = {}
+        context = runtime_parameters or {}
+        for step in workflow.steps:
+            step_parameters, unresolved = self._bind_step_parameters(
+                step,
+                context,
+            )
+            if unresolved:
+                workflow.error = _UNRESOLVED_TEMPLATE_ERROR
+                step.error = _UNRESOLVED_TEMPLATE_ERROR
+                logger.warning(_UNRESOLVED_TEMPLATE_ERROR)
+                return False
+            bound_parameters[step.id] = step_parameters
+
+        workflow.error = None
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
             step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                step_parameters = bound_parameters[step.id]
+                if step_parameters:
+                    result = step.handler(**step_parameters)
+                else:
+                    result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
                 workflow.status = StepStatus.FAILED
+                workflow.error = str(e)
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _bind_step_parameters(
+        self,
+        step: WorkflowStep,
+        runtime_parameters: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], bool]:
+        missing: Set[str] = set()
+        bound = {
+            key: self._bind_template_values(value, runtime_parameters, missing)
+            for key, value in step.parameters.items()
+        }
+        return bound, bool(missing)
+
+    def _bind_template_values(
+        self,
+        value: Any,
+        runtime_parameters: Dict[str, Any],
+        missing: Set[str],
+    ) -> Any:
+        if isinstance(value, str):
+            return self._render_template(value, runtime_parameters, missing)
+        if isinstance(value, dict):
+            return {
+                key: self._bind_template_values(
+                    child,
+                    runtime_parameters,
+                    missing,
+                )
+                for key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                self._bind_template_values(child, runtime_parameters, missing)
+                for child in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                self._bind_template_values(child, runtime_parameters, missing)
+                for child in value
+            )
+        if isinstance(value, set):
+            return {
+                self._bind_template_values(child, runtime_parameters, missing)
+                for child in value
+            }
+        return value
+
+    def _render_template(
+        self,
+        value: str,
+        runtime_parameters: Dict[str, Any],
+        missing: Set[str],
+    ) -> str:
+        rendered = value
+
+        def replace(match: re.Match) -> str:
+            name = match.group(1)
+            if name not in runtime_parameters:
+                missing.add(name)
+                return match.group(0)
+            return str(runtime_parameters[name])
+
+        for pattern in _TEMPLATE_PATTERNS:
+            rendered = pattern.sub(replace, rendered)
+        return rendered
 
 # 2019-03-27T19:58:07 update
 
