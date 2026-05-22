@@ -53,6 +53,22 @@ def test_trailing_slash_redirect_candidate_requires_auth_before_redirect():
     assert response.headers["www-authenticate"] == "Bearer"
 
 
+def test_encoded_slash_redirect_candidate_requires_auth_before_redirect():
+    client = make_client({})
+
+    encoded_segment_response = client.get(
+        "/api/v2%2Fagents/",
+        follow_redirects=False,
+    )
+    encoded_repeated_response = client.get(
+        "/api/v2/%2f%2fagents",
+        follow_redirects=False,
+    )
+
+    assert encoded_segment_response.status_code == 401
+    assert encoded_repeated_response.status_code == 401
+
+
 def test_anonymous_and_malformed_principals_are_denied():
     client = make_client({"valid": principal("valid")})
 
