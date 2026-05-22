@@ -1,4 +1,4 @@
-import pytest
+import time
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +35,70 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dequeue_defers_unhealthy_dependency_without_dispatch(self):
+        self.scheduler = TaskScheduler(dependency_defer_delay=60)
+        self.scheduler.set_dependency_health("payments-api", False)
+        task_id = self.scheduler.enqueue(
+            {
+                "type": "charge",
+                "payload": {"amount": "private"},
+                "dependencies": ["payments-api"],
+            },
+            priority=5,
+        )
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is None
+        assert task_id not in self.scheduler._in_flight
+        assert task_id in self.scheduler._scheduled
+        scheduled_task = self.scheduler._scheduled[task_id]
+        assert scheduled_task["status"] == "deferred"
+        assert scheduled_task["defer_reason"] == "dependency_unhealthy"
+        assert scheduled_task["deferred_dependencies"] == ["payments-api"]
+
+        audit = self.scheduler.audit_records[-1]
+        assert audit["decision"] == "deferred"
+        assert audit["dependencies"] == ["payments-api"]
+        assert "payload" not in audit
+
+    def test_deferred_dependency_runs_after_dependency_recovers(self):
+        self.scheduler = TaskScheduler(dependency_defer_delay=60)
+        self.scheduler.set_dependency_health("search-api", False)
+        task_id = self.scheduler.enqueue(
+            {"type": "index", "dependencies": ["search-api"]}
+        )
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+
+        self.scheduler.set_dependency_health("search-api", True)
+        self.scheduler._scheduled[task_id]["scheduled_for"] = time.time() - 1
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is not None
+        assert task["id"] == task_id
+        assert task["status"] == "pending"
+        assert self.scheduler._scheduled == {}
+        assert self.scheduler._in_flight[task_id] is task
+
+    def test_unhealthy_task_does_not_block_ready_task(self):
+        self.scheduler = TaskScheduler(dependency_defer_delay=60)
+        self.scheduler.set_dependency_health("analytics-api", False)
+        self.scheduler.enqueue(
+            {"type": "blocked", "dependencies": ["analytics-api"]},
+            priority=10,
+        )
+        self.scheduler.enqueue({"type": "ready"}, priority=1)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task is not None
+        assert task["type"] == "ready"
+        assert len(self.scheduler.audit_records) == 1
 
 # 2019-01-09T19:07:03 update
 
