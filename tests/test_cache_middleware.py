@@ -1,10 +1,10 @@
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
-from src.api.middleware import CacheControlMiddleware
+from src.api.middleware import CACHE_STATE_KEY, CacheControlMiddleware
 from src.api.server import create_app
 
 
@@ -69,12 +69,38 @@ def test_existing_vary_values_are_preserved_for_authenticated_json():
     assert response.headers["vary"] == "Accept-Encoding, Authorization, Cookie"
 
 
+def test_authenticated_json_clears_request_state_after_success():
+    app = FastAPI()
+    app.add_middleware(CacheControlMiddleware)
+    captured_requests = []
+    saw_cache_state = []
+
+    @app.get("/json")
+    async def json_response(request: Request):
+        captured_requests.append(request)
+        saw_cache_state.append(hasattr(request.state, CACHE_STATE_KEY))
+        return {"ok": True}
+
+    client = TestClient(app)
+
+    response = client.get("/json", headers=AUTH_HEADERS)
+
+    assert response.status_code == 200
+    assert saw_cache_state == [True]
+    assert captured_requests
+    assert not hasattr(captured_requests[0].state, CACHE_STATE_KEY)
+
+
 def test_exception_path_does_not_leak_authenticated_cache_state():
     app = FastAPI()
     app.add_middleware(CacheControlMiddleware)
+    captured_requests = []
+    saw_cache_state = []
 
     @app.get("/boom")
-    async def boom():
+    async def boom(request: Request):
+        captured_requests.append(request)
+        saw_cache_state.append(hasattr(request.state, CACHE_STATE_KEY))
         raise RuntimeError("network token secret should not be logged")
 
     @app.get("/json")
@@ -87,4 +113,7 @@ def test_exception_path_does_not_leak_authenticated_cache_state():
     next_response = client.get("/json")
 
     assert error_response.status_code == 500
+    assert saw_cache_state == [True]
+    assert captured_requests
+    assert not hasattr(captured_requests[0].state, CACHE_STATE_KEY)
     assert "cache-control" not in next_response.headers
