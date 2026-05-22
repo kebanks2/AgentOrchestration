@@ -7,9 +7,33 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .auth import AuthError, IntegrationAuthService, extract_integration_token
+from .auth import (
+    AuthError,
+    IntegrationAuthService,
+    extract_integration_token,
+    require_scope,
+    require_workspace_role,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _webhook_workspace_id(request: Request) -> str | None:
+    if request.method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return None
+
+    parts = request.url.path.strip("/").split("/")
+    if len(parts) != 5:
+        return None
+    api, version, workspaces, workspace_id, webhooks = parts
+    if (
+        api == "api"
+        and version == "v2"
+        and workspaces == "workspaces"
+        and webhooks == "webhooks"
+    ):
+        return workspace_id
+    return None
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -34,7 +58,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 IntegrationAuthService(),
             )
             try:
-                request.state.principal = auth_service.authenticate(token)
+                principal = auth_service.authenticate(token)
+                workspace_id = _webhook_workspace_id(request)
+                if workspace_id is not None:
+                    require_scope(principal, "webhooks:manage")
+                    require_workspace_role(
+                        principal,
+                        workspace_id,
+                        {"owner", "admin"},
+                    )
+                request.state.principal = principal
             except AuthError as exc:
                 return JSONResponse(
                     status_code=exc.status_code,

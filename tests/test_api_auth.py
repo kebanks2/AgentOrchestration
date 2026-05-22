@@ -98,8 +98,18 @@ def create_webhook(client, token=None, session_token=None):
     )
 
 
+def create_malformed_webhook(client, token=None):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return client.post("/api/v2/workspaces/acme/webhooks", headers=headers)
+
+
 def test_webhook_management_rejects_anonymous_client():
     response = create_webhook(make_client())
+    assert response.status_code == 401
+
+
+def test_webhook_management_rejects_unknown_credentials():
+    response = create_webhook(make_client(), token="unknown-token")
     assert response.status_code == 401
 
 
@@ -123,6 +133,11 @@ def test_webhook_management_rejects_disabled_principal():
     assert response.status_code == 403
 
 
+def test_webhook_management_rejects_disabled_browser_session():
+    response = create_webhook(make_client(), session_token="disabled-token")
+    assert response.status_code == 403
+
+
 def test_webhook_management_rejects_insufficient_scope():
     response = create_webhook(make_client(), token="missing-scope-token")
     assert response.status_code == 403
@@ -131,6 +146,22 @@ def test_webhook_management_rejects_insufficient_scope():
 def test_webhook_management_rejects_insufficient_workspace_role():
     response = create_webhook(make_client(), token="wrong-role-token")
     assert response.status_code == 403
+
+
+def test_webhook_management_authorizes_before_request_validation():
+    response = create_malformed_webhook(
+        make_client(),
+        token="wrong-role-token",
+    )
+    assert response.status_code == 403
+
+
+def test_webhook_management_validates_request_after_authorization():
+    response = create_malformed_webhook(
+        make_client(),
+        token="valid-admin-token",
+    )
+    assert response.status_code == 422
 
 
 def test_webhook_management_allows_authorized_token_client():
