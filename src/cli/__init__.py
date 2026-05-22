@@ -1,8 +1,8 @@
 """Command-line interface module."""
 
-from .main import cli
+from .main import build_parser, cli
 
-__all__ = ["cli"]
+__all__ = ["build_parser", "cli"]
 
 # 2019-03-06T18:02:23 update
 
