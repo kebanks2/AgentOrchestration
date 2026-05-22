@@ -1,4 +1,6 @@
 import pytest
+
+from src.common.task_state import WorkspaceScopeRequired
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -7,34 +9,111 @@ class TestTaskScheduler:
         self.scheduler = TaskScheduler()
 
     def test_enqueue_task(self):
-        task_id = self.scheduler.enqueue({"type": "test", "payload": {}})
+        task_id = self.scheduler.enqueue(
+            {"type": "test", "payload": {}},
+            workspace_id="workspace-a",
+        )
         assert task_id is not None
+        assert self.scheduler.get_state(
+            task_id,
+            workspace_id="workspace-a",
+        ).status == "queued"
 
     def test_dequeue_task(self):
-        self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
+        self.scheduler.enqueue(
+            {"type": "test", "payload": {"data": 1}},
+            workspace_id="workspace-a",
+        )
         import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-a")
+        )
         assert task is not None
         assert task["type"] == "test"
 
     def test_enqueue_multiple_priorities(self):
-        self.scheduler.enqueue({"type": "low"}, priority=1)
-        self.scheduler.enqueue({"type": "high"}, priority=10)
+        self.scheduler.enqueue(
+            {"type": "low"},
+            priority=1,
+            workspace_id="workspace-a",
+        )
+        self.scheduler.enqueue(
+            {"type": "high"},
+            priority=10,
+            workspace_id="workspace-a",
+        )
         import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
+        task = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-a")
+        )
         assert task["type"] == "high"
 
     def test_complete_task(self):
-        self.scheduler.enqueue({"type": "test"})
+        self.scheduler.enqueue({"type": "test"}, workspace_id="workspace-a")
         import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
-        assert self.scheduler.complete(task["id"])
+        task = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-a")
+        )
+        assert self.scheduler.complete(
+            task["id"],
+            workspace_id="workspace-a",
+        )
+        assert self.scheduler.get_state(
+            task["id"],
+            workspace_id="workspace-a",
+        ).status == "completed"
 
     def test_fail_task_with_retry(self):
-        self.scheduler.enqueue({"type": "test"})
+        self.scheduler.enqueue({"type": "test"}, workspace_id="workspace-a")
         import asyncio
-        task = asyncio.run(self.scheduler.dequeue())
-        assert self.scheduler.fail(task["id"])
+        task = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-a")
+        )
+        assert self.scheduler.fail(task["id"], workspace_id="workspace-a")
+        assert self.scheduler.get_state(
+            task["id"],
+            workspace_id="workspace-a",
+        ).status == "queued"
+
+    def test_task_id_collisions_are_isolated_by_workspace(self, monkeypatch):
+        monkeypatch.setattr(
+            "src.orchestrator.scheduler.uuid4",
+            lambda: "task-123",
+        )
+
+        self.scheduler.enqueue({"type": "a"}, workspace_id="workspace-a")
+        self.scheduler.enqueue({"type": "b"}, workspace_id="workspace-b")
+        import asyncio
+        task_a = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-a")
+        )
+        task_b = asyncio.run(
+            self.scheduler.dequeue(workspace_id="workspace-b")
+        )
+
+        assert self.scheduler.complete(
+            task_a["id"],
+            workspace_id="workspace-a",
+        )
+        assert self.scheduler.get_state(
+            task_a["id"],
+            workspace_id="workspace-a",
+        ).status == "completed"
+        assert self.scheduler.complete(
+            task_b["id"],
+            workspace_id="workspace-b",
+        )
+        assert self.scheduler.get_state(
+            "task-123",
+            workspace_id="workspace-b",
+        ).status == "completed"
+
+    def test_scheduler_blocks_unscoped_task_state_access(self):
+        with pytest.raises(WorkspaceScopeRequired, match="workspace_id"):
+            self.scheduler.enqueue({"type": "test"}, workspace_id="")
+
+        with pytest.raises(WorkspaceScopeRequired, match="workspace_id"):
+            self.scheduler.get_state_by_task_id("task-123")
 
 # 2019-01-09T19:07:03 update
 

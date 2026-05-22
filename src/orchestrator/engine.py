@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
 from src.orchestrator.scheduler import TaskScheduler
@@ -12,11 +12,17 @@ logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        workspace_id: str = "default",
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
+        self.workspace_id = workspace_id
         self._running = False
         self._hooks: Dict[str, List[Callable]] = {
             "pre_execute": [],
@@ -33,7 +39,7 @@ class OrchestrationEngine:
         self._running = True
         logger.info("Orchestration engine started")
         while self._running:
-            task = await self.scheduler.dequeue()
+            task = await self.scheduler.dequeue(workspace_id=self.workspace_id)
             if task:
                 asyncio.create_task(self._execute_task(task))
             await asyncio.sleep(0.1)
@@ -82,7 +88,12 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": (
+                f"Task {task['id']} processed by {agent['name']}"
+            ),
+        }
 
 # 2019-04-24T14:55:39 update
 
