@@ -9,10 +9,94 @@ from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
 
+AUTHENTICATED_JSON_CACHE_CONTROL = "no-store"
+CACHE_STATE_KEY = "authenticated_json_cache_candidate"
+
+
+def _has_bearer_token(value: str) -> bool:
+    if not value.startswith("Bearer "):
+        return False
+    return bool(value[len("Bearer "):].strip())
+
+
+def _is_authenticated_request(request: Request) -> bool:
+    return _has_bearer_token(
+        request.headers.get("Authorization", "")
+    ) or bool(request.cookies.get("ao_session", "").strip())
+
+
+def _is_json_response(response: Response) -> bool:
+    content_type = response.headers.get("content-type", "").lower()
+    media_type = content_type.split(";", 1)[0].strip()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
+def _merge_vary(existing: str, additions: tuple[str, ...]) -> str:
+    values = []
+    seen = set()
+    existing_values = [
+        part.strip()
+        for part in existing.split(",")
+        if part.strip()
+    ]
+    for value in existing_values:
+        normalized = value.lower()
+        if normalized not in seen:
+            seen.add(normalized)
+            values.append(value)
+    for value in additions:
+        normalized = value.lower()
+        if normalized not in seen:
+            seen.add(normalized)
+            values.append(value)
+    return ", ".join(values)
+
+
+def _clear_cache_state(request: Request) -> None:
+    try:
+        delattr(request.state, CACHE_STATE_KEY)
+    except AttributeError:
+        pass
+
+
+class CacheControlMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        authenticated = _is_authenticated_request(request)
+        setattr(request.state, CACHE_STATE_KEY, authenticated)
+        try:
+            response = await call_next(request)
+            if authenticated and _is_json_response(response):
+                response.headers["Cache-Control"] = (
+                    AUTHENTICATED_JSON_CACHE_CONTROL
+                )
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+                response.headers["Vary"] = _merge_vary(
+                    response.headers.get("Vary", ""),
+                    ("Authorization", "Cookie"),
+                )
+                logger.info(
+                    "cache-control applied to authenticated JSON response"
+                )
+            return response
+        finally:
+            _clear_cache_state(request)
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +110,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +134,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
