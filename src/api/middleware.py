@@ -2,17 +2,80 @@
 
 import time
 import logging
-from typing import Callable
+from typing import Callable, Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
+
+from .auth import (
+    AuthError,
+    IntegrationAuthService,
+    extract_operator_token,
+    require_operator_permission,
+)
 
 logger = logging.getLogger(__name__)
 
 
+def _run_cancellation_workspace_id(request: Request) -> Optional[str]:
+    if request.method != "POST":
+        return None
+
+    parts = request.url.path.strip("/").split("/")
+    if len(parts) != 7:
+        return None
+
+    api, version, workspaces, workspace_id, runs, _run_id, action = parts
+    if (
+        api == "api"
+        and version == "v2"
+        and workspaces == "workspaces"
+        and runs == "runs"
+        and action == "cancel"
+    ):
+        return workspace_id
+    return None
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
+            cancellation_workspace_id = _run_cancellation_workspace_id(request)
+            if cancellation_workspace_id is not None:
+                token = extract_operator_token(request)
+                if not token:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Unauthorized"},
+                    )
+                auth_service = getattr(
+                    request.app.state,
+                    "auth_service",
+                    IntegrationAuthService(),
+                )
+                try:
+                    principal = auth_service.authenticate(token)
+                    require_operator_permission(
+                        principal,
+                        cancellation_workspace_id,
+                        "runs:cancel",
+                        {"owner", "admin", "operator"},
+                    )
+                    request.state.principal = principal
+                except AuthError as exc:
+                    return JSONResponse(
+                        status_code=exc.status_code,
+                        content={"detail": exc.detail},
+                    )
+                return await call_next(request)
+
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +89,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +112,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            f"{request.method} {request.url.path} "
+            f"{response.status_code} {duration:.3f}s"
+        )
         return response
 
 # 2019-03-01T18:35:19 update
