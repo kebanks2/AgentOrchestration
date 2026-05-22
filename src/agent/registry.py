@@ -1,10 +1,13 @@
 """Agent Registry — Manages agent lifecycle and metadata."""
 
-import json
+import logging
 import time
 import uuid
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentStatus(Enum):
@@ -16,13 +19,38 @@ class AgentStatus(Enum):
     TERMINATED = "terminated"
 
 
+class HandlerVersionError(ValueError):
+    """Raised when a handler registration violates version compatibility."""
+
+
 class AgentRegistry:
     def __init__(self, storage_backend: str = "memory"):
         self.storage_backend = storage_backend
         self._agents: Dict[str, Dict[str, Any]] = {}
         self._index: Dict[str, List[str]] = {}
+        self._handler_versions: Dict[str, str] = {}
+        self._resolution_cache: Dict[Tuple[str, Optional[str]], str] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._registry_metrics: Dict[str, int] = {
+            "handler_version_rejections": 0,
+            "handler_cache_invalidations": 0,
+        }
 
-    def register(self, name: str, agent_type: str, config: Optional[Dict] = None) -> str:
+    def register(
+        self,
+        name: str,
+        agent_type: str,
+        config: Optional[Dict] = None,
+    ) -> str:
+        config = dict(config or {})
+        handler_version = self._handler_version(config)
+        previous_version = self._handler_versions.get(agent_type)
+        self._enforce_handler_version_policy(
+            agent_type,
+            handler_version,
+            previous_version,
+        )
+
         agent_id = str(uuid.uuid4())
         timestamp = time.time()
         self._agents[agent_id] = {
@@ -30,22 +58,67 @@ class AgentRegistry:
             "name": name,
             "type": agent_type,
             "status": AgentStatus.PENDING.value,
-            "config": config or {},
+            "config": config,
             "created_at": timestamp,
             "updated_at": timestamp,
-            "version": "1.0.0",
+            "version": handler_version,
             "metrics": {"tasks_completed": 0, "errors": 0, "uptime": 0},
         }
         group = agent_type.split(".")[0]
         if group not in self._index:
             self._index[group] = []
         self._index[group].append(agent_id)
+        if previous_version != handler_version:
+            self._handler_versions[agent_type] = handler_version
+            self._invalidate_resolution_cache(agent_type)
         return agent_id
 
     def get(self, agent_id: str) -> Optional[Dict[str, Any]]:
         return self._agents.get(agent_id)
 
-    def list(self, status: Optional[AgentStatus] = None, group: Optional[str] = None) -> List[Dict[str, Any]]:
+    def resolve_handler(
+        self,
+        agent_type: str,
+        required_version: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        cache_key = (agent_type, required_version)
+        cached_agent_id = self._resolution_cache.get(cache_key)
+        if cached_agent_id:
+            cached_agent = self._agents.get(cached_agent_id)
+            if cached_agent and self._is_resolvable(
+                cached_agent,
+                required_version,
+            ):
+                return cached_agent
+            self._resolution_cache.pop(cache_key, None)
+
+        candidates = [
+            agent
+            for agent in self._agents.values()
+            if agent["type"] == agent_type
+            and self._is_resolvable(agent, required_version)
+        ]
+        if not candidates:
+            self._record_policy_decision(
+                "handler_resolution_rejected",
+                agent_type,
+                required_version,
+                "no compatible handler version registered",
+            )
+            return None
+
+        selected = max(
+            candidates,
+            key=lambda agent: self._parse_version(agent["version"]),
+        )
+        self._resolution_cache[cache_key] = selected["id"]
+        return selected
+
+    def list(
+        self,
+        status: Optional[AgentStatus] = None,
+        group: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         agents = self._agents.values()
         if status:
             agents = [a for a in agents if a["status"] == status.value]
@@ -68,10 +141,148 @@ class AgentRegistry:
         group = agent["type"].split(".")[0]
         if group in self._index and agent_id in self._index[group]:
             self._index[group].remove(agent_id)
+        self._invalidate_resolution_cache(agent["type"])
         return True
 
     def count(self) -> int:
         return len(self._agents)
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return list(self._audit_records)
+
+    def registry_metrics(self) -> Dict[str, int]:
+        return dict(self._registry_metrics)
+
+    def _handler_version(self, config: Dict[str, Any]) -> str:
+        version = config.get(
+            "handler_version",
+            config.get("protocol_version", config.get("version", "1.0.0")),
+        )
+        version = str(version)
+        return self._format_version(self._parse_version(version))
+
+    def _enforce_handler_version_policy(
+        self,
+        agent_type: str,
+        requested_version: str,
+        current_version: Optional[str],
+    ) -> None:
+        if current_version is None or requested_version == current_version:
+            return
+
+        requested = self._parse_version(requested_version)
+        current = self._parse_version(current_version)
+        if requested < current:
+            self._reject_handler_version(
+                agent_type,
+                requested_version,
+                "stale handler version",
+            )
+
+        active_agents = self._active_agents(agent_type)
+        if requested[0] != current[0] and active_agents:
+            self._reject_handler_version(
+                agent_type,
+                requested_version,
+                "incompatible major version while handlers are active",
+            )
+
+    def _reject_handler_version(
+        self,
+        agent_type: str,
+        version: str,
+        reason: str,
+    ) -> None:
+        self._registry_metrics["handler_version_rejections"] += 1
+        self._record_policy_decision(
+            "handler_registration_rejected",
+            agent_type,
+            version,
+            reason,
+        )
+        raise HandlerVersionError(reason)
+
+    def _is_resolvable(
+        self,
+        agent: Dict[str, Any],
+        required_version: Optional[str],
+    ) -> bool:
+        if agent["status"] in {
+            AgentStatus.FAILED.value,
+            AgentStatus.TERMINATED.value,
+        }:
+            return False
+        if required_version is None:
+            return True
+
+        requested = self._parse_version(required_version)
+        available = self._parse_version(agent["version"])
+        return available[0] == requested[0] and available >= requested
+
+    def _active_agents(self, agent_type: str) -> List[Dict[str, Any]]:
+        return [
+            agent
+            for agent in self._agents.values()
+            if agent["type"] == agent_type
+            and agent["status"] in {
+                AgentStatus.PENDING.value,
+                AgentStatus.RUNNING.value,
+                AgentStatus.PAUSED.value,
+            }
+        ]
+
+    def _invalidate_resolution_cache(self, agent_type: str) -> None:
+        keys = [key for key in self._resolution_cache if key[0] == agent_type]
+        for key in keys:
+            self._resolution_cache.pop(key, None)
+        if keys:
+            self._registry_metrics["handler_cache_invalidations"] += len(keys)
+            self._record_policy_decision(
+                "handler_resolution_cache_invalidated",
+                agent_type,
+                self._handler_versions.get(agent_type),
+                "handler version changed",
+            )
+
+    def _record_policy_decision(
+        self,
+        event: str,
+        agent_type: str,
+        requested_version: Optional[str],
+        reason: str,
+    ) -> None:
+        record = {
+            "event": event,
+            "agent_type": agent_type,
+            "requested_version": requested_version,
+            "known_version": self._handler_versions.get(agent_type),
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._audit_records.append(record)
+        logger.warning(
+            (
+                "agent handler registry policy decision: "
+                "%s type=%s version=%s reason=%s"
+            ),
+            event,
+            agent_type,
+            requested_version,
+            reason,
+        )
+
+    def _parse_version(self, version: str) -> Tuple[int, int, int]:
+        parts = version.split(".")
+        if len(parts) == 2:
+            parts.append("0")
+        if len(parts) != 3 or not all(part.isdigit() for part in parts):
+            raise HandlerVersionError(
+                "handler version must use MAJOR.MINOR or MAJOR.MINOR.PATCH"
+            )
+        return int(parts[0]), int(parts[1]), int(parts[2])
+
+    def _format_version(self, version: Tuple[int, int, int]) -> str:
+        return ".".join(str(part) for part in version)
 
 # 2019-01-29T11:24:49 update
 

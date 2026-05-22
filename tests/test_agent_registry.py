@@ -1,5 +1,5 @@
 import pytest
-from src.agent.registry import AgentRegistry, AgentStatus
+from src.agent.registry import AgentRegistry, AgentStatus, HandlerVersionError
 
 
 class TestAgentRegistry:
@@ -47,6 +47,116 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_rejects_incompatible_plugin_upgrade_while_handler_active(self):
+        agent_id = self.registry.register(
+            "payments-agent",
+            "worker.payments",
+            {"handler_version": "1.2.0", "runtime_config": "do-not-log"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(HandlerVersionError):
+            self.registry.register(
+                "payments-agent-v2",
+                "worker.payments",
+                {"handler_version": "2.0.0", "runtime_config": "do-not-log"},
+            )
+
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert self.registry.count() == 1
+        metrics = self.registry.registry_metrics()
+        assert metrics["handler_version_rejections"] == 1
+        audit = self.registry.audit_records()[-1]
+        assert audit["event"] == "handler_registration_rejected"
+        assert audit["agent_type"] == "worker.payments"
+        assert audit["requested_version"] == "2.0.0"
+        assert "runtime_config" not in str(audit)
+
+    def test_rejects_stale_handler_version_without_mutating_registry(self):
+        current_id = self.registry.register(
+            "payments-agent",
+            "worker.payments",
+            {"handler_version": "1.4.0"},
+        )
+
+        with pytest.raises(HandlerVersionError):
+            self.registry.register(
+                "payments-agent-old",
+                "worker.payments",
+                {"handler_version": "1.3.9"},
+            )
+
+        assert self.registry.count() == 1
+        assert self.registry.get(current_id)["version"] == "1.4.0"
+        resolved = self.registry.resolve_handler("worker.payments")
+        assert resolved["id"] == current_id
+
+    def test_rejects_incompatible_protocol_upgrade_while_rpc_active(self):
+        agent_id = self.registry.register(
+            "rpc-agent",
+            "worker.rpc",
+            {"protocol_version": "1.0"},
+        )
+        assert self.registry.update_status(agent_id, AgentStatus.RUNNING)
+
+        with pytest.raises(HandlerVersionError):
+            self.registry.register(
+                "rpc-agent-v2",
+                "worker.rpc",
+                {"protocol_version": "2.0"},
+            )
+
+        assert self.registry.count() == 1
+        agent = self.registry.get(agent_id)
+        assert agent["status"] == AgentStatus.RUNNING.value
+        assert agent["version"] == "1.0.0"
+        audit = self.registry.audit_records()[-1]
+        assert audit["event"] == "handler_registration_rejected"
+        assert audit["agent_type"] == "worker.rpc"
+        assert audit["requested_version"] == "2.0.0"
+
+    def test_compatible_plugin_upgrade_invalidates_cache(self):
+        first_id = self.registry.register(
+            "payments-agent",
+            "worker.payments",
+            {"handler_version": "1.2.0"},
+        )
+        resolved = self.registry.resolve_handler("worker.payments")
+        assert resolved["id"] == first_id
+
+        upgraded_id = self.registry.register(
+            "payments-agent-new",
+            "worker.payments",
+            {"handler_version": "1.3.0"},
+        )
+
+        resolved = self.registry.resolve_handler(
+            "worker.payments",
+            required_version="1.2.0",
+        )
+        assert resolved["id"] == upgraded_id
+        assert resolved["version"] == "1.3.0"
+        metrics = self.registry.registry_metrics()
+        assert metrics["handler_cache_invalidations"] == 1
+
+    def test_resolution_rejects_unavailable_handler_version(self):
+        self.registry.register(
+            "payments-agent",
+            "worker.payments",
+            {"handler_version": "1.2.0"},
+        )
+
+        resolved = self.registry.resolve_handler(
+            "worker.payments",
+            required_version="2.0.0",
+        )
+        assert resolved is None
+        audit = self.registry.audit_records()[-1]
+        assert audit["event"] == "handler_resolution_rejected"
+        assert audit["agent_type"] == "worker.payments"
+        assert audit["requested_version"] == "2.0.0"
 
 # 2019-01-23T10:28:57 update
 
