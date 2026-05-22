@@ -93,3 +93,31 @@ def test_workflow_rejects_missing_parameter_before_handler_runs():
     assert seen == []
     assert workflow.status == StepStatus.FAILED
     assert workflow.steps[0].status == StepStatus.FAILED
+
+
+def test_workflow_binds_all_parameters_before_any_handler_runs():
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("release")
+    seen = []
+
+    workflow.add_step(
+        WorkflowStep(
+            "first",
+            lambda params: seen.append(params),
+            parameter_defaults={"enabled": False},
+            required_parameters=["enabled"],
+        )
+    )
+    workflow.add_step(
+        WorkflowStep(
+            "second",
+            lambda params: seen.append(params),
+            required_parameters=["missing"],
+        )
+    )
+
+    assert not manager.execute_workflow(workflow.id)
+    assert seen == []
+    assert workflow.status == StepStatus.FAILED
+    assert workflow.steps[0].status == StepStatus.PENDING
+    assert workflow.steps[1].status == StepStatus.FAILED

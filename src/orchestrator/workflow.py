@@ -140,10 +140,20 @@ class WorkflowManager:
         if not workflow:
             return False
 
-        workflow.status = StepStatus.RUNNING
+        bound_steps = []
         for step in workflow.steps:
             try:
                 bound_parameters = step.bind_parameters()
+            except Exception as e:
+                step.error = str(e)
+                step.status = StepStatus.FAILED
+                workflow.status = StepStatus.FAILED
+                return False
+            bound_steps.append((step, bound_parameters))
+
+        workflow.status = StepStatus.RUNNING
+        for step, bound_parameters in bound_steps:
+            try:
                 step.status = StepStatus.RUNNING
                 if self._handler_accepts_parameters(step.handler):
                     result = step.handler(bound_parameters)
