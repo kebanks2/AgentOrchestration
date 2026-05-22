@@ -174,7 +174,8 @@ class TaskScheduler:
 
     def _task_dependencies(self, task: Dict) -> List[str]:
         raw = (
-            task.get("dependencies")
+            task.get("external_dependencies")
+            or task.get("dependencies")
             or task.get("required_dependencies")
             or []
         )

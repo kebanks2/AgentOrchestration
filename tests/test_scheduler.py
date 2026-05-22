@@ -68,7 +68,7 @@ class TestTaskScheduler:
         self.scheduler = TaskScheduler(dependency_defer_delay=60)
         self.scheduler.set_dependency_health("search-api", False)
         task_id = self.scheduler.enqueue(
-            {"type": "index", "dependencies": ["search-api"]}
+            {"type": "index", "external_dependencies": ["search-api"]}
         )
 
         import asyncio
