@@ -1,5 +1,6 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import inspect
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -13,16 +14,89 @@ class StepStatus(Enum):
     SKIPPED = "skipped"
 
 
+class WorkflowParameterError(ValueError):
+    """Raised when workflow parameters fail pre-dispatch validation."""
+
+
+def merge_parameters(
+    defaults: Optional[Dict[str, Any]] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+    required: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    merged = dict(defaults or {})
+    for key, value in (overrides or {}).items():
+        merged[key] = value
+
+    missing = [key for key in required or [] if key not in merged]
+    if missing:
+        missing_keys = ", ".join(sorted(missing))
+        raise WorkflowParameterError(
+            "missing required workflow parameters: " + missing_keys
+        )
+    return merged
+
+
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        parameter_defaults: Optional[Dict[str, Any]] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        required_parameters: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.parameter_defaults = dict(parameter_defaults or {})
+        self.parameters = dict(parameters or {})
+        self.required_parameters = list(required_parameters or [])
+        self.bound_parameters: Dict[str, Any] = {}
+        self.parameter_decisions: List[Dict[str, Any]] = []
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+
+    def bind_parameters(self) -> Dict[str, Any]:
+        try:
+            bound = merge_parameters(
+                self.parameter_defaults,
+                self.parameters,
+                self.required_parameters,
+            )
+        except WorkflowParameterError:
+            self._record_parameter_decision(
+                "parameters_rejected",
+                "missing_required",
+                self.required_parameters,
+            )
+            raise
+
+        self.bound_parameters = bound
+        self._record_parameter_decision(
+            "parameters_bound",
+            "accepted",
+            bound.keys(),
+        )
+        return dict(bound)
+
+    def _record_parameter_decision(
+        self,
+        action: str,
+        reason: str,
+        keys,
+    ) -> None:
+        self.parameter_decisions.append(
+            {
+                "action": action,
+                "reason": reason,
+                "keys": sorted(keys),
+            }
+        )
 
 
 class Workflow:
@@ -68,9 +142,13 @@ class WorkflowManager:
 
         workflow.status = StepStatus.RUNNING
         for step in workflow.steps:
-            step.status = StepStatus.RUNNING
             try:
-                result = step.handler()
+                bound_parameters = step.bind_parameters()
+                step.status = StepStatus.RUNNING
+                if self._handler_accepts_parameters(step.handler):
+                    result = step.handler(bound_parameters)
+                else:
+                    result = step.handler()
                 step.result = result
                 step.status = StepStatus.COMPLETED
             except Exception as e:
@@ -81,6 +159,17 @@ class WorkflowManager:
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _handler_accepts_parameters(self, handler: Callable) -> bool:
+        signature = inspect.signature(handler)
+        for parameter in signature.parameters.values():
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.VAR_POSITIONAL,
+            ):
+                return True
+        return False
 
 # 2019-03-27T19:58:07 update
 
