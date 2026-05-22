@@ -1,10 +1,22 @@
 """Orchestration engine module."""
 
+from .deployment import (
+    DeploymentHistory,
+    DeploymentManifestRenderer,
+    ReleaseIdentity,
+)
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "DeploymentHistory",
+    "DeploymentManifestRenderer",
+    "OrchestrationEngine",
+    "ReleaseIdentity",
+    "TaskScheduler",
+    "WorkflowManager",
+]
 
 # 2019-07-01T16:04:27 update
 
