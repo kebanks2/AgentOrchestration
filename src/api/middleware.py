@@ -7,16 +7,48 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from .auth import AuthError, AutomationAuthService, READ_POLICY, WRITE_POLICY
+
 logger = logging.getLogger(__name__)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
-            token = request.headers.get("Authorization", "")
-            if not token.startswith("Bearer "):
-                return Response(status_code=401, content="Unauthorized")
+    def __init__(self, app, auth_service: AutomationAuthService = None):
+        super().__init__(app)
+        self.auth_service = auth_service or AutomationAuthService()
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if self._is_protected_api_path(request.url.path):
+            try:
+                request.state.principal = self.auth_service.authorize_header(
+                    request.headers.get("Authorization", ""),
+                    self._policy_for(request),
+                    self._client_kind_for(request),
+                )
+            except AuthError as error:
+                return Response(
+                    status_code=error.status_code,
+                    content=error.reason,
+                )
         return await call_next(request)
+
+    def _is_protected_api_path(self, path: str) -> bool:
+        return path.startswith("/api/v2") and path != "/api/v2/auth/token"
+
+    def _policy_for(self, request: Request):
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return READ_POLICY
+        return WRITE_POLICY
+
+    def _client_kind_for(self, request: Request) -> str:
+        client_kind = request.headers.get("X-AO-Client-Kind", "").lower()
+        if client_kind in {"machine", "browser"}:
+            return client_kind
+        return "browser" if request.headers.get("Cookie") else "machine"
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -26,14 +58,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +82,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
