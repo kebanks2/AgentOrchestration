@@ -57,6 +57,11 @@ def test_anonymous_and_malformed_principals_are_denied():
     client = make_client({"valid": principal("valid")})
 
     assert client.get("/api/v2/agents").status_code == 401
+    unknown_response = client.get(
+        "/api/v2/agents/",
+        headers={"Authorization": "Bearer missing"},
+        follow_redirects=False,
+    )
     token_response = client.get(
         "/api/v2/agents",
         headers={"Authorization": "Token valid"},
@@ -66,6 +71,7 @@ def test_anonymous_and_malformed_principals_are_denied():
         headers={"Authorization": "Bearer   "},
     )
 
+    assert unknown_response.status_code == 401
     assert token_response.status_code == 401
     assert blank_response.status_code == 401
 
@@ -111,6 +117,33 @@ def test_browser_session_cookie_uses_same_protected_route_guard():
 
     assert response.status_code == 200
     assert response.json() == {"agents": []}
+
+
+def test_browser_session_cookie_can_complete_write_and_read_workflow():
+    client = make_client(
+        {
+            "session-token": principal(
+                "session-token",
+                scopes={"orchestration:read", "orchestration:write"},
+                role="admin",
+            )
+        }
+    )
+    client.cookies.set("ao_session", "session-token")
+
+    create_response = client.post(
+        "/api/v2/agents",
+        params={"name": "browser-worker", "agent_type": "worker.browser"},
+        follow_redirects=False,
+    )
+    assert create_response.status_code == 200
+
+    list_response = client.get("/api/v2/agents/")
+    assert list_response.status_code == 200
+    assert any(
+        agent["name"] == "browser-worker"
+        for agent in list_response.json()["agents"]
+    )
 
 
 def test_revoked_browser_session_cookie_is_denied_before_handler():
@@ -161,4 +194,7 @@ def test_authorized_workspace_role_still_completes_read_and_write_workflow():
 
     list_response = client.get("/api/v2/agents/", headers=headers)
     assert list_response.status_code == 200
-    assert list_response.json()["agents"][0]["name"] == "worker-a"
+    assert any(
+        agent["name"] == "worker-a"
+        for agent in list_response.json()["agents"]
+    )
