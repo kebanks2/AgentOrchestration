@@ -1,6 +1,7 @@
 import pytest
 
 from src.cli import build_parser
+from src.cli.main import cli
 
 
 class TestCliParser:
@@ -41,6 +42,15 @@ class TestCliParser:
         assert args.command == "status"
         assert args.watch is True
 
+    def test_build_parser_exposes_logs_tail_default(self):
+        parser = build_parser()
+
+        args = parser.parse_args(["logs", "agent-2"])
+
+        assert args.command == "logs"
+        assert args.agent_id == "agent-2"
+        assert args.tail == 50
+
     def test_build_parser_allows_inspection_without_cli_exit(self):
         parser = build_parser()
 
@@ -64,3 +74,24 @@ class TestCliParser:
 
         with pytest.raises(SystemExit):
             parser.parse_args(["--unknown"])
+
+    def test_cli_wrapper_accepts_explicit_argv(self, monkeypatch, capsys):
+        log_levels = []
+        monkeypatch.setattr(
+            "src.cli.main.configure_logging",
+            log_levels.append,
+        )
+
+        cli(["--verbose", "deploy", "agent.yaml"])
+
+        assert log_levels == ["DEBUG"]
+        assert capsys.readouterr().out == (
+            "Deploying agent from manifest: agent.yaml\n"
+        )
+
+    def test_cli_wrapper_keeps_no_command_help_exit(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            cli([])
+
+        assert exc.value.code == 1
+        assert "Available commands" in capsys.readouterr().out
