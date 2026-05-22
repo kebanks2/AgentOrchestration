@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,87 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_worker_disconnect_reclaims_reserved_task_once(self):
+        task_id = self.scheduler.enqueue({"type": "test"}, priority=5)
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+
+        assert task["id"] == task_id
+        assert task["status"] == "reserved"
+        assert task["reserved_by"] == "worker-a"
+        old_token = task["reservation_token"]
+
+        assert self.scheduler.worker_disconnected("worker-a") == [task_id]
+        assert self.scheduler.worker_disconnected("worker-a") == []
+        assert not self.scheduler.complete(task_id)
+
+        next_task = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+        assert next_task["id"] == task_id
+        assert next_task["status"] == "reserved"
+        assert next_task["reserved_by"] == "worker-b"
+        assert next_task["reservation_token"] != old_token
+        assert not self.scheduler.complete(
+            task_id,
+            reservation_token=old_token,
+        )
+        assert self.scheduler.complete(
+            task_id,
+            reservation_token=next_task["reservation_token"],
+        )
+
+        reclaim_events = [
+            event
+            for event in self.scheduler.audit_events
+            if event["event"] == "reservation_reclaimed"
+        ]
+        assert len(reclaim_events) == 1
+        assert reclaim_events[0]["task_id"] == task_id
+        assert reclaim_events[0]["worker_id"] == "worker-a"
+        assert reclaim_events[0]["reason"] == "worker_disconnected"
+        assert "payload" not in reclaim_events[0]
+
+    def test_reclaim_abandoned_requeues_expired_reservation(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        reserved_at = task["reserved_at"]
+
+        assert self.scheduler.reclaim_abandoned(
+            reservation_timeout=60,
+            now=reserved_at + 59,
+        ) == []
+
+        assert self.scheduler.reclaim_abandoned(
+            reservation_timeout=60,
+            now=reserved_at + 61,
+        ) == [task_id]
+
+        next_task = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+        assert next_task["id"] == task_id
+        assert next_task["retries"] == 0
+
+    def test_stale_failure_token_does_not_requeue_current_reservation(self):
+        task_id = self.scheduler.enqueue({"type": "test"})
+        import asyncio
+        first_task = asyncio.run(self.scheduler.dequeue(worker_id="worker-a"))
+        old_token = first_task["reservation_token"]
+
+        assert self.scheduler.worker_disconnected("worker-a") == [task_id]
+        second_task = asyncio.run(self.scheduler.dequeue(worker_id="worker-b"))
+
+        assert not self.scheduler.fail(task_id, reservation_token=old_token)
+        assert self.scheduler.fail(
+            task_id,
+            reservation_token=second_task["reservation_token"],
+        )
+
+        rejected_events = [
+            event
+            for event in self.scheduler.audit_events
+            if event["event"] == "reservation_rejected"
+        ]
+        assert rejected_events[0]["reason"] == "stale_reservation_token"
 
 # 2019-01-09T19:07:03 update
 
