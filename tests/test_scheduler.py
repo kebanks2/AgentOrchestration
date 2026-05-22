@@ -1,5 +1,14 @@
 import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import (
+    PriorityQueue,
+    QueueCapacityError,
+    TaskScheduler,
+)
+
+
+class FailingQueue(PriorityQueue):
+    def push(self, item, priority=0):
+        raise RuntimeError("storage rollback")
 
 
 class TestTaskScheduler:
@@ -35,6 +44,64 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_enqueue_rollback_releases_reserved_capacity(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler._queues["default"] = FailingQueue()
+        failed_task = {"type": "test", "payload": {"secret": "raw"}}
+
+        with pytest.raises(RuntimeError):
+            scheduler.enqueue(failed_task)
+
+        assert scheduler.capacity_used("default") == 0
+        assert "id" not in failed_task
+        assert "enqueued_at" not in failed_task
+        record = scheduler.queue_decisions()[-1]
+        assert record["action"] == "enqueue_rollback"
+        assert record["queue"] == "default"
+        assert record["reason"] == "RuntimeError"
+        assert "payload" not in record
+
+        scheduler._queues["default"] = PriorityQueue()
+        task_id = scheduler.enqueue({"type": "after"})
+
+        assert task_id is not None
+        assert scheduler.capacity_used("default") == 1
+
+    def test_capacity_rejection_does_not_mutate_existing_queue(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        first_task_id = scheduler.enqueue(
+            {"type": "first", "payload": {"keep": True}}
+        )
+        rejected_task = {"type": "second", "payload": {"secret": "raw"}}
+
+        with pytest.raises(QueueCapacityError):
+            scheduler.enqueue(rejected_task)
+
+        assert scheduler.capacity_used("default") == 1
+        assert "id" not in rejected_task
+        assert "enqueued_at" not in rejected_task
+        record = scheduler.queue_decisions()[-1]
+        assert record["action"] == "enqueue_rejected"
+        assert record["reason"] == "capacity_exceeded"
+        assert "payload" not in record
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert task["id"] == first_task_id
+        assert task["type"] == "first"
+
+    def test_capacity_counts_in_flight_until_completion(self):
+        scheduler = TaskScheduler(max_queue_size=1)
+        scheduler.enqueue({"type": "test"})
+
+        import asyncio
+        task = asyncio.run(scheduler.dequeue())
+
+        assert scheduler.capacity_used("default") == 1
+        assert scheduler.complete(task["id"])
+        assert scheduler.capacity_used("default") == 0
 
 # 2019-01-09T19:07:03 update
 
