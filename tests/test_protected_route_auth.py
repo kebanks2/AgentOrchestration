@@ -43,8 +43,13 @@ def test_trailing_slash_redirect_candidate_requires_auth_before_redirect():
     client = make_client({})
 
     response = client.get("/api/v2/agents/", follow_redirects=False)
+    repeated_slash_response = client.get(
+        "/api/v2//agents",
+        follow_redirects=False,
+    )
 
     assert response.status_code == 401
+    assert repeated_slash_response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
 
 
@@ -106,6 +111,33 @@ def test_browser_session_cookie_uses_same_protected_route_guard():
 
     assert response.status_code == 200
     assert response.json() == {"agents": []}
+
+
+def test_revoked_browser_session_cookie_is_denied_before_handler():
+    client = make_client(
+        {"session-token": principal("session-token", revoked=True)}
+    )
+    client.cookies.set("ao_session", "session-token")
+
+    response = client.get("/api/v2/agents/")
+
+    assert response.status_code == 401
+
+
+def test_wrong_workspace_role_is_denied_before_handler():
+    client = make_client({"valid": principal("valid", role="editor")})
+
+    response = client.post(
+        "/api/v2/agents/",
+        params={"name": "worker-a", "agent_type": "worker.processor"},
+        headers={
+            "Authorization": "Bearer valid",
+            "X-Workspace-ID": "other-workspace",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 403
 
 
 def test_authorized_workspace_role_still_completes_read_and_write_workflow():
