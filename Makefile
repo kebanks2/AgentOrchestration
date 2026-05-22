@@ -1,4 +1,4 @@
-.PHONY: install test lint clean build run
+.PHONY: install test lint clean build run release-sbom
 
 install:
 	uv sync
@@ -16,6 +16,9 @@ clean:
 
 build:
 	uv build
+
+release-sbom:
+	python scripts/generate_sbom.py --strict --output sbom.cyclonedx.json
 
 run:
 	uvicorn src.api.server:create_app --reload --host 0.0.0.0 --port 8000
