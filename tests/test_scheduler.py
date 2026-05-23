@@ -1,4 +1,7 @@
-import pytest
+import asyncio
+import time
+from datetime import datetime, timedelta, timezone
+
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -12,7 +15,6 @@ class TestTaskScheduler:
 
     def test_dequeue_task(self):
         self.scheduler.enqueue({"type": "test", "payload": {"data": 1}})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task is not None
         assert task["type"] == "test"
@@ -20,21 +22,85 @@ class TestTaskScheduler:
     def test_enqueue_multiple_priorities(self):
         self.scheduler.enqueue({"type": "low"}, priority=1)
         self.scheduler.enqueue({"type": "high"}, priority=10)
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert task["type"] == "high"
 
     def test_complete_task(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.complete(task["id"])
+        outcome = self.scheduler.get_terminal_outcome(task["id"])
+        assert outcome["status"] == "completed"
+        assert self.scheduler.complete(task["id"]) is False
 
     def test_fail_task_with_retry(self):
         self.scheduler.enqueue({"type": "test"})
-        import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+        retried = asyncio.run(self.scheduler.dequeue())
+        assert retried["id"] == task["id"]
+        assert retried["retries"] == 1
+
+    def test_expired_aware_datetime_preserves_scheduled_task_and_id(self):
+        run_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        task_id = self.scheduler.schedule(
+            {"type": "cron", "payload": {"job": "close-ledger"}},
+            run_at,
+        )
+
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert task["id"] == task_id
+        assert task["type"] == "cron"
+        assert task["payload"]["job"] == "close-ledger"
+        assert task_id not in self.scheduler._scheduled
+        assert task["scheduled_for"] <= time.time()
+
+    def test_timezone_equivalent_datetimes_resolve_to_same_epoch(self):
+        utc_run = datetime(2030, 1, 1, 15, 0, tzinfo=timezone.utc)
+        eastern = timezone(timedelta(hours=-5))
+        eastern_run = datetime(2030, 1, 1, 10, 0, tzinfo=eastern)
+
+        utc_id = self.scheduler.schedule({"type": "utc"}, utc_run)
+        eastern_id = self.scheduler.schedule({"type": "eastern"}, eastern_run)
+
+        assert self.scheduler._scheduled[utc_id]["run_at"] == (
+            self.scheduler._scheduled[eastern_id]["run_at"]
+        )
+
+    def test_naive_datetime_is_treated_as_utc(self):
+        naive = datetime(2030, 6, 1, 12, 30)
+        aware = datetime(2030, 6, 1, 12, 30, tzinfo=timezone.utc)
+
+        task_id = self.scheduler.schedule({"type": "cron"}, naive)
+
+        assert self.scheduler._scheduled[task_id]["run_at"] == (
+            aware.timestamp()
+        )
+
+    def test_cancel_scheduled_task_records_one_terminal_outcome(self):
+        task_id = self.scheduler.schedule(
+            {"type": "cron"},
+            datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+
+        assert self.scheduler.cancel(task_id) is True
+        assert self.scheduler.cancel(task_id) is False
+        assert task_id not in self.scheduler._scheduled
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "cancelled"
+
+    def test_retry_exhaustion_records_single_failed_outcome(self):
+        self.scheduler._max_retries = 1
+        task_id = self.scheduler.enqueue({"type": "fragile"})
+        task = asyncio.run(self.scheduler.dequeue())
+
+        assert self.scheduler.fail(task["id"]) is True
+        assert self.scheduler.fail(task["id"]) is False
+        outcome = self.scheduler.get_terminal_outcome(task_id)
+        assert outcome["status"] == "failed"
+        assert outcome["task"]["retries"] == 1
 
 # 2019-01-09T19:07:03 update
 

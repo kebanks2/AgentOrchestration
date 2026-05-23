@@ -1,10 +1,12 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Union
 from uuid import uuid4
+
+ScheduleInput = Union[int, float, timedelta, datetime]
 
 
 class PriorityQueue:
@@ -33,34 +35,92 @@ class PriorityQueue:
 class TaskScheduler:
     def __init__(self):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict[str, Any]] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._terminal_outcomes: Dict[str, Dict[str, Any]] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
         task["retries"] = 0
+        self._enqueue_ready(task, queue, priority)
+        return task_id
 
+    def _enqueue_ready(
+        self,
+        task: Dict,
+        queue: str,
+        priority: int = 0,
+    ) -> None:
+        task["queue"] = queue
+        task["priority"] = priority
+        task["enqueued_at"] = time.time()
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
-        return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def _resolve_run_at(self, schedule_for: ScheduleInput) -> float:
+        if isinstance(schedule_for, (int, float)):
+            return time.time() + max(0.0, float(schedule_for))
+        if isinstance(schedule_for, timedelta):
+            return time.time() + max(0.0, schedule_for.total_seconds())
+        if isinstance(schedule_for, datetime):
+            if schedule_for.tzinfo is None:
+                schedule_for = schedule_for.replace(tzinfo=timezone.utc)
+            else:
+                schedule_for = schedule_for.astimezone(timezone.utc)
+            return schedule_for.timestamp()
+        raise TypeError(
+            "schedule delay must be seconds, timedelta, or datetime"
+        )
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: ScheduleInput,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        task["retries"] = 0
+        run_at = self._resolve_run_at(delay)
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": run_at,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+        expired = [
+            tid
+            for tid, scheduled in self._scheduled.items()
+            if scheduled["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            scheduled = self._scheduled.pop(tid, None)
+            if not scheduled or tid in self._terminal_outcomes:
+                continue
+            task = scheduled["task"]
+            task["scheduled_for"] = scheduled["run_at"]
+            self._enqueue_ready(
+                task,
+                scheduled["queue"],
+                priority=scheduled["priority"],
+            )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -70,16 +130,57 @@ class TaskScheduler:
         return None
 
     def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+        task = self._in_flight.pop(task_id, None)
+        if not task:
+            return False
+        return self._record_terminal(task_id, task, "completed")
 
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
+        if not task:
+            return False
+
+        task["retries"] += 1
+        task["last_failed_at"] = time.time()
+        if task["retries"] < self._max_retries:
+            self._enqueue_ready(task, queue, priority=task.get("priority", 0))
+            return True
+        return self._record_terminal(task_id, task, "failed")
+
+    def cancel(self, task_id: str) -> bool:
+        scheduled = self._scheduled.pop(task_id, None)
+        if scheduled:
+            return self._record_terminal(
+                task_id,
+                scheduled["task"],
+                "cancelled",
+            )
+
+        task = self._in_flight.pop(task_id, None)
         if task:
-            task["retries"] += 1
-            if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
-                return True
+            return self._record_terminal(task_id, task, "cancelled")
         return False
+
+    def get_terminal_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        outcome = self._terminal_outcomes.get(task_id)
+        if not outcome:
+            return None
+        return dict(outcome)
+
+    def _record_terminal(
+        self,
+        task_id: str,
+        task: Dict,
+        status: str,
+    ) -> bool:
+        if task_id in self._terminal_outcomes:
+            return False
+        self._terminal_outcomes[task_id] = {
+            "status": status,
+            "task": dict(task),
+            "recorded_at": time.time(),
+        }
+        return True
 
 # 2019-04-25T08:37:12 update
 
