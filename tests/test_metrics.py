@@ -1,5 +1,14 @@
-import pytest
 from src.common.metrics import MetricsCollector
+
+
+class LockProbeNumber:
+    def __init__(self, value, lock):
+        self.value = value
+        self.lock = lock
+
+    def __radd__(self, other):
+        assert not self.lock.locked()
+        return other + self.value
 
 
 class TestMetricsCollector:
@@ -30,6 +39,13 @@ class TestMetricsCollector:
         time.sleep(0.01)
         duration = self.metrics.stop_timer("operation")
         assert duration > 0.005
+
+    def test_snapshot_formats_histograms_outside_lock(self):
+        self.metrics._histograms["response.time"].append(
+            LockProbeNumber(0.5, self.metrics._lock)
+        )
+        snapshot = self.metrics.snapshot()
+        assert snapshot["histograms"]["response.time"]["sum"] == 0.5
 
 # 2019-07-16T09:29:21 update
 
