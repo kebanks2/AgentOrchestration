@@ -57,6 +57,70 @@ def test_compensating_action_runs_and_blocks_downstream_after_failure():
     assert "compensated step mutate-state" in workflow.audit_log
 
 
+def test_terminal_workflow_rejects_duplicate_execution_after_rollback():
+    events = []
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("no-duplicate-rollback")
+    mutate = WorkflowStep(
+        "mutate-state",
+        lambda: events.append("mutate"),
+        requires_compensation=True,
+        compensating_action=lambda: events.append("undo-mutate"),
+    )
+
+    def fail_step():
+        events.append("fail")
+        raise RuntimeError("handler failed")
+
+    workflow.add_step(mutate).add_step(WorkflowStep("fail", fail_step))
+
+    assert manager.execute_workflow(workflow.id) is False
+    assert workflow.status == StepStatus.ROLLED_BACK
+    assert manager.execute_workflow(workflow.id) is False
+    assert workflow.status == StepStatus.ROLLED_BACK
+    assert events == ["mutate", "fail", "undo-mutate"]
+    assert workflow.audit_log[-1] == (
+        "duplicate execution rejected for rolled_back"
+    )
+
+
+def test_compensation_runs_in_reverse_completion_order():
+    events = []
+    manager = WorkflowManager()
+    workflow = manager.create_workflow("reverse-rollback")
+    first = WorkflowStep(
+        "first",
+        lambda: events.append("first"),
+        requires_compensation=True,
+        compensating_action=lambda: events.append("undo-first"),
+    )
+    second = WorkflowStep(
+        "second",
+        lambda: events.append("second"),
+        requires_compensation=True,
+        compensating_action=lambda: events.append("undo-second"),
+    )
+
+    def fail_step():
+        events.append("fail")
+        raise RuntimeError("handler failed")
+
+    workflow.add_step(first).add_step(second).add_step(
+        WorkflowStep("fail", fail_step)
+    )
+
+    assert manager.execute_workflow(workflow.id) is False
+    assert events == [
+        "first",
+        "second",
+        "fail",
+        "undo-second",
+        "undo-first",
+    ]
+    assert first.status == StepStatus.COMPENSATED
+    assert second.status == StepStatus.COMPENSATED
+
+
 def test_compensation_failure_fails_closed_and_blocks_downstream():
     events = []
     manager = WorkflowManager()

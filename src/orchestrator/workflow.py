@@ -98,6 +98,19 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        if workflow.status in {
+            StepStatus.COMPLETED,
+            StepStatus.FAILED,
+            StepStatus.ROLLED_BACK,
+        }:
+            message = (
+                "duplicate execution rejected for "
+                f"{workflow.status.value}"
+            )
+            workflow.audit_log.append(message)
+            logger.warning("Workflow %s %s", workflow.id, message)
+            return False
+
         if not self._validate_compensation_plan(workflow):
             return False
 
