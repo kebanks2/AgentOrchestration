@@ -2,9 +2,16 @@
 
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
-from .workflow import WorkflowManager
+from .workflow import StepStatus, Workflow, WorkflowManager, WorkflowStep
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "StepStatus",
+    "Workflow",
+    "WorkflowManager",
+    "WorkflowStep",
+]
 
 # 2019-07-01T16:04:27 update
 

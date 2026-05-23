@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -11,18 +14,45 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    BLOCKED = "blocked"
+    COMPENSATED = "compensated"
+    ROLLED_BACK = "rolled_back"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+        requires_compensation: bool = False,
+        compensating_action: Optional[Callable] = None,
+        depends_on: Optional[List[str]] = None,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
         self.retries = retries
         self.timeout = timeout
+        self.requires_compensation = requires_compensation
+        self.compensating_action = compensating_action
+        self.depends_on = list(depends_on or [])
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+
+    def set_compensating_action(self, action: Callable) -> "WorkflowStep":
+        self.compensating_action = action
+        return self
+
+    def require_compensation(self) -> "WorkflowStep":
+        self.requires_compensation = True
+        return self
+
+    def add_dependency(self, step: "WorkflowStep") -> "WorkflowStep":
+        self.depends_on.append(step.id)
+        return self
 
 
 class Workflow:
@@ -33,6 +63,8 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.validation_errors: List[str] = []
+        self.audit_log: List[str] = []
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -66,8 +98,11 @@ class WorkflowManager:
         if not workflow:
             return False
 
+        if not self._validate_compensation_plan(workflow):
+            return False
+
         workflow.status = StepStatus.RUNNING
-        for step in workflow.steps:
+        for index, step in enumerate(workflow.steps):
             step.status = StepStatus.RUNNING
             try:
                 result = step.handler()
@@ -76,11 +111,101 @@ class WorkflowManager:
             except Exception as e:
                 step.error = str(e)
                 step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+                self._rollback_completed_steps(workflow, index)
                 return False
 
         workflow.status = StepStatus.COMPLETED
         return True
+
+    def _validate_compensation_plan(self, workflow: Workflow) -> bool:
+        workflow.validation_errors = []
+        known_steps = {
+            identifier
+            for step in workflow.steps
+            for identifier in (step.id, step.name)
+        }
+
+        for step in workflow.steps:
+            for dependency in step.depends_on:
+                if dependency not in known_steps:
+                    workflow.validation_errors.append(
+                        (
+                            f"step {step.name} depends on unknown "
+                            f"step {dependency}"
+                        )
+                    )
+
+        for index, step in enumerate(workflow.steps[:-1]):
+            has_downstream = any(
+                downstream.depends_on == []
+                or step.id in downstream.depends_on
+                or step.name in downstream.depends_on
+                for downstream in workflow.steps[index + 1:]
+            )
+            if (
+                step.requires_compensation
+                and has_downstream
+                and not callable(step.compensating_action)
+            ):
+                workflow.validation_errors.append(
+                    f"step {step.name} can affect downstream work but has no "
+                    "compensating action"
+                )
+
+        if workflow.validation_errors:
+            message = "; ".join(workflow.validation_errors)
+            workflow.audit_log.append(
+                f"compensation validation rejected: {message}"
+            )
+            logger.warning("Workflow %s rejected: %s", workflow.id, message)
+            return False
+        return True
+
+    def _rollback_completed_steps(
+        self,
+        workflow: Workflow,
+        failed_index: int,
+    ) -> None:
+        blocked_reason = "blocked after partial rollback"
+        rollback_errors = []
+
+        for step in reversed(workflow.steps[:failed_index]):
+            if not step.requires_compensation:
+                continue
+            if not callable(step.compensating_action):
+                step.error = "missing compensating action"
+                rollback_errors.append(
+                    f"{step.name}: missing compensating action"
+                )
+                continue
+            try:
+                step.compensating_action()
+                step.status = StepStatus.COMPENSATED
+                workflow.audit_log.append(f"compensated step {step.name}")
+            except Exception as e:
+                step.error = str(e)
+                step.status = StepStatus.FAILED
+                rollback_errors.append(f"{step.name}: {e}")
+
+        for step in workflow.steps[failed_index + 1:]:
+            if step.status == StepStatus.PENDING:
+                step.status = StepStatus.BLOCKED
+                step.error = blocked_reason
+
+        if rollback_errors:
+            workflow.status = StepStatus.FAILED
+            message = "; ".join(rollback_errors)
+            workflow.audit_log.append(f"partial rollback failed: {message}")
+            logger.warning(
+                "Workflow %s rollback failed: %s",
+                workflow.id,
+                message,
+            )
+            return
+
+        workflow.status = StepStatus.ROLLED_BACK
+        workflow.audit_log.append(blocked_reason)
+        logger.warning("Workflow %s %s", workflow.id, blocked_reason)
 
 # 2019-03-27T19:58:07 update
 
