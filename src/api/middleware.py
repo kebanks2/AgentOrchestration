@@ -1,5 +1,6 @@
 """API middleware components."""
 
+import asyncio
 import time
 import logging
 from typing import Callable
@@ -10,9 +11,98 @@ from starlette.responses import Response
 logger = logging.getLogger(__name__)
 
 
+def register_downstream_task(
+    request: Request,
+    task: asyncio.Task,
+) -> asyncio.Task:
+    tasks = getattr(request.state, "downstream_agent_tasks", None)
+    if tasks is None:
+        tasks = set()
+        request.state.downstream_agent_tasks = tasks
+    tasks.add(task)
+    return task
+
+
+def request_cancelled(request: Request) -> bool:
+    return bool(getattr(request.state, "agent_request_cancelled", False))
+
+
+class CancellationPropagationMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        request.state.downstream_agent_tasks = set()
+        request.state.agent_request_cancelled = False
+        try:
+            if (
+                self._client_cancelled(request)
+                or await request.is_disconnected()
+            ):
+                request.state.agent_request_cancelled = True
+                logger.warning("Request cancellation rejected before dispatch")
+                return self._terminal_response("pre-dispatch")
+
+            response = await call_next(request)
+            response.headers["X-Agent-Request-State"] = "completed"
+            return response
+        except asyncio.CancelledError:
+            request.state.agent_request_cancelled = True
+            await self._cancel_downstream(request)
+            logger.warning(
+                "Request cancellation propagated to downstream work"
+            )
+            return self._terminal_response("propagated")
+        except Exception:
+            await self._cancel_downstream(request)
+            logger.warning("Request exception cleared downstream work")
+            raise
+        finally:
+            self._clear_request_state(request)
+
+    def _client_cancelled(self, request: Request) -> bool:
+        header = request.headers.get("x-agent-request-cancelled", "")
+        return header.lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+    async def _cancel_downstream(self, request: Request) -> None:
+        tasks = list(getattr(request.state, "downstream_agent_tasks", ()))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _terminal_response(self, phase: str) -> Response:
+        return Response(
+            status_code=499,
+            content="Request cancelled",
+            headers={
+                "X-Agent-Request-State": "cancelled",
+                "X-Agent-Cancellation": phase,
+            },
+        )
+
+    def _clear_request_state(self, request: Request) -> None:
+        for key in ("downstream_agent_tasks", "agent_request_cancelled"):
+            if hasattr(request.state, key):
+                delattr(request.state, key)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +116,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip]
+            if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +140,21 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable,
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
