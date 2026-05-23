@@ -1,5 +1,7 @@
-import pytest
-from src.orchestrator.scheduler import TaskScheduler
+from src.orchestrator.scheduler import (
+    SchedulerCoordinationStore,
+    TaskScheduler,
+)
 
 
 class TestTaskScheduler:
@@ -35,6 +37,111 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_schedule_dequeues_original_task(self):
+        self.scheduler.schedule(
+            {"type": "scheduled", "payload": {"a": 1}},
+            delay=0,
+        )
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["type"] == "scheduled"
+        assert task["payload"] == {"a": 1}
+
+
+class FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestSchedulerRolloutCoordination:
+    def setup_method(self):
+        self.clock = FakeClock()
+        self.store = SchedulerCoordinationStore(clock=self.clock)
+
+    def scheduler(self, release_id):
+        return TaskScheduler(
+            release_id=release_id,
+            coordination_store=self.store,
+            scheduler_group="billing-cron",
+            leader_lease_ttl=30,
+            clock=self.clock,
+        )
+
+    def test_non_leader_skips_cron_registration(self):
+        old_scheduler = self.scheduler("old-release")
+        new_scheduler = self.scheduler("new-release")
+
+        task_id = old_scheduler.register_cron_job(
+            {"type": "billing-close", "payload": {"period": "daily"}},
+            "0 0 * * *",
+            job_key="billing-close:daily",
+        )
+        skipped = new_scheduler.register_cron_job(
+            {"type": "billing-close", "payload": {"period": "daily"}},
+            "0 0 * * *",
+            job_key="billing-close:daily",
+        )
+
+        assert task_id is not None
+        assert skipped is None
+        assert self.store.registered_job_count("billing-cron") == 1
+
+    def test_rollout_deduplicates_cron_jobs_after_leadership_change(
+        self,
+        caplog,
+    ):
+        caplog.set_level("INFO", logger="src.orchestrator.scheduler")
+        old_scheduler = self.scheduler("old-release")
+        new_scheduler = self.scheduler("new-release")
+
+        first_task_id = old_scheduler.register_cron_job(
+            {"type": "billing-close", "payload": {"period": "daily"}},
+            "0 0 * * *",
+            delay=5,
+            job_key="billing-close:daily",
+        )
+        self.clock.advance(31)
+        second_task_id = new_scheduler.register_cron_job(
+            {"type": "billing-close", "payload": {"period": "daily"}},
+            "0 0 * * *",
+            delay=5,
+            job_key="billing-close:daily",
+        )
+
+        assert second_task_id == first_task_id
+        assert self.store.registered_job_count("billing-cron") == 1
+        leadership_logs = [
+            record for record in caplog.records
+            if record.message == "scheduler leadership changed"
+        ]
+        assert [record.release_id for record in leadership_logs] == [
+            "old-release",
+            "new-release",
+        ]
+
+    def test_overlapping_schedulers_claim_due_cron_job_once(self):
+        old_scheduler = self.scheduler("old-release")
+        new_scheduler = self.scheduler("new-release")
+        old_scheduler.register_cron_job(
+            {"type": "billing-close", "payload": {"period": "daily"}},
+            "0 0 * * *",
+            job_key="billing-close:daily",
+        )
+
+        import asyncio
+        old_task = asyncio.run(old_scheduler.dequeue())
+        new_task = asyncio.run(new_scheduler.dequeue())
+
+        assert old_task is not None
+        assert old_task["type"] == "billing-close"
+        assert new_task is None
 
 # 2019-01-09T19:07:03 update
 

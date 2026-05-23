@@ -1,10 +1,17 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
+import copy
+import json
+import logging
 import heapq
+import os
+import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from uuid import uuid4
+
+
+logger = logging.getLogger(__name__)
 
 
 class PriorityQueue:
@@ -30,37 +37,254 @@ class PriorityQueue:
         return len(self._queue)
 
 
+class SchedulerCoordinationStore:
+    """Shared scheduler coordination state.
+
+    This in-memory implementation mirrors the atomic API a database-backed
+    store would expose in production: leader leases, idempotent cron records,
+    and once-only due-job claims are all protected by one lock.
+    """
+
+    def __init__(self, clock: Optional[Callable[[], float]] = None):
+        self._clock = clock or time.time
+        self._lock = threading.RLock()
+        self._leaders: Dict[str, Dict[str, Any]] = {}
+        self._cron_jobs: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    def claim_leadership(
+        self,
+        group: str,
+        release_id: str,
+        lease_ttl: float,
+        now: Optional[float] = None,
+    ) -> bool:
+        now = self._clock() if now is None else now
+        with self._lock:
+            current = self._leaders.get(group)
+            if current and current["expires_at"] > now:
+                if current["release_id"] != release_id:
+                    return False
+                current["expires_at"] = now + lease_ttl
+                return True
+
+            previous_release_id = current["release_id"] if current else None
+            self._leaders[group] = {
+                "release_id": release_id,
+                "expires_at": now + lease_ttl,
+            }
+            if previous_release_id != release_id:
+                logger.info(
+                    "scheduler leadership changed",
+                    extra={
+                        "scheduler_group": group,
+                        "previous_release_id": previous_release_id,
+                        "release_id": release_id,
+                    },
+                )
+            return True
+
+    def register_cron_job(
+        self,
+        group: str,
+        job_key: str,
+        task: Dict,
+        run_at: float,
+        queue: str,
+        priority: int,
+        release_id: str,
+        cron_expression: str,
+    ) -> Tuple[str, bool]:
+        store_key = (group, job_key)
+        with self._lock:
+            existing = self._cron_jobs.get(store_key)
+            if existing:
+                return existing["task_id"], False
+
+            task_id = task.get("id") or str(uuid4())
+            stored_task = copy.deepcopy(task)
+            stored_task["id"] = task_id
+            stored_task["scheduled_by_release"] = release_id
+            stored_task["cron_expression"] = cron_expression
+            self._cron_jobs[store_key] = {
+                "task_id": task_id,
+                "task": stored_task,
+                "run_at": run_at,
+                "queue": queue,
+                "priority": priority,
+                "release_id": release_id,
+                "cron_expression": cron_expression,
+                "claimed_by": None,
+                "claimed_at": None,
+            }
+            return task_id, True
+
+    def claim_due_jobs(
+        self,
+        group: str,
+        release_id: str,
+        now: Optional[float] = None,
+    ) -> List[Dict]:
+        now = self._clock() if now is None else now
+        claimed: List[Dict] = []
+        with self._lock:
+            for (job_group, job_key), record in self._cron_jobs.items():
+                if job_group != group:
+                    continue
+                if record["claimed_by"] is not None or record["run_at"] > now:
+                    continue
+                record["claimed_by"] = release_id
+                record["claimed_at"] = now
+                claimed.append(
+                    {
+                        "job_key": job_key,
+                        "task": copy.deepcopy(record["task"]),
+                        "queue": record["queue"],
+                        "priority": record["priority"],
+                    }
+                )
+        return claimed
+
+    def registered_job_count(self, group: Optional[str] = None) -> int:
+        with self._lock:
+            if group is None:
+                return len(self._cron_jobs)
+            return sum(
+                1 for job_group, _ in self._cron_jobs if job_group == group
+            )
+
+
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        release_id: Optional[str] = None,
+        coordination_store: Optional[SchedulerCoordinationStore] = None,
+        scheduler_group: str = "default",
+        leader_lease_ttl: float = 30.0,
+        clock: Optional[Callable[[], float]] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
-        self._scheduled: Dict[str, float] = {}
+        self._scheduled: Dict[str, Dict] = {}
         self._in_flight: Dict[str, Dict] = {}
         self._max_retries = 3
+        self._clock = clock or time.time
+        self.release_id = (
+            release_id
+            or os.getenv("RELEASE_ID")
+            or os.getenv("GIT_SHA")
+            or "local"
+        )
+        self.scheduler_group = scheduler_group
+        self.leader_lease_ttl = leader_lease_ttl
+        self.coordination_store = coordination_store
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = self._clock()
+        task["retries"] = task.get("retries", 0)
+        task["priority"] = priority
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        self._scheduled[task_id] = time.time() + delay
+        self._scheduled[task_id] = {
+            "task": task,
+            "run_at": self._clock() + delay,
+            "queue": queue,
+            "priority": priority,
+        }
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
-        now = time.time()
-        expired = [tid for tid, t in self._scheduled.items() if t <= now]
+    def register_cron_job(
+        self,
+        task: Dict,
+        cron_expression: str,
+        delay: float = 0,
+        queue: str = "default",
+        priority: int = 0,
+        job_key: Optional[str] = None,
+    ) -> Optional[str]:
+        if self.coordination_store is None:
+            return self.schedule(task, delay, queue=queue, priority=priority)
+
+        is_leader = self.coordination_store.claim_leadership(
+            self.scheduler_group,
+            self.release_id,
+            self.leader_lease_ttl,
+            now=self._clock(),
+        )
+        if not is_leader:
+            logger.info(
+                "scheduler cron registration skipped by non-leader",
+                extra={
+                    "scheduler_group": self.scheduler_group,
+                    "release_id": self.release_id,
+                    "cron_expression": cron_expression,
+                },
+            )
+            return None
+
+        effective_job_key = job_key or self._cron_job_key(
+            task, cron_expression, queue, priority
+        )
+        task_id, created = self.coordination_store.register_cron_job(
+            self.scheduler_group,
+            effective_job_key,
+            task,
+            self._clock() + delay,
+            queue,
+            priority,
+            self.release_id,
+            cron_expression,
+        )
+        if not created:
+            logger.info(
+                "scheduler cron registration deduplicated",
+                extra={
+                    "scheduler_group": self.scheduler_group,
+                    "release_id": self.release_id,
+                    "job_key": effective_job_key,
+                    "cron_expression": cron_expression,
+                    "task_id": task_id,
+                },
+            )
+        return task_id
+
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
+        now = self._clock()
+        self._enqueue_due_coordinated_jobs(now)
+        expired = [
+            tid for tid, record in self._scheduled.items()
+            if record["run_at"] <= now
+        ]
         for tid in expired:
-            task = self._scheduled.pop(tid)
-            if task:
-                self.enqueue(task, queue)
+            record = self._scheduled.pop(tid)
+            if record:
+                self.enqueue(
+                    record["task"],
+                    record.get("queue", queue),
+                    priority=record.get("priority", 0),
+                )
 
         if queue in self._queues and len(self._queues[queue]) > 0:
             task = self._queues[queue].pop()
@@ -80,6 +304,38 @@ class TaskScheduler:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def _enqueue_due_coordinated_jobs(self, now: float) -> None:
+        if self.coordination_store is None:
+            return
+        due_jobs = self.coordination_store.claim_due_jobs(
+            self.scheduler_group,
+            self.release_id,
+            now=now,
+        )
+        for record in due_jobs:
+            self.enqueue(
+                record["task"],
+                record["queue"],
+                priority=record["priority"],
+            )
+
+    def _cron_job_key(
+        self,
+        task: Dict,
+        cron_expression: str,
+        queue: str,
+        priority: int,
+    ) -> str:
+        payload = {
+            "type": task.get("type"),
+            "payload": task.get("payload", {}),
+            "queue": queue,
+            "priority": priority,
+            "cron_expression": cron_expression,
+            "job_key": task.get("job_key"),
+        }
+        return json.dumps(payload, sort_keys=True, default=str)
 
 # 2019-04-25T08:37:12 update
 
