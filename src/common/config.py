@@ -1,8 +1,13 @@
 """Configuration management module."""
 
-import os
 import json
+import os
 from typing import Any, Dict, Optional
+
+
+_MISSING = object()
+_TRUE_STRINGS = frozenset({"1", "true", "yes", "y", "on", "enabled"})
+_FALSE_STRINGS = frozenset({"0", "false", "no", "n", "off", "disabled"})
 
 
 class Config:
@@ -43,6 +48,30 @@ class Config:
             else:
                 return default
         return current
+
+    def get_bool(
+        self,
+        key: str,
+        default: Optional[bool] = None,
+    ) -> Optional[bool]:
+        """Return a typed boolean config value or fail on ambiguous input."""
+        value = self.get(key, _MISSING)
+        if value is _MISSING:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in _TRUE_STRINGS:
+                return True
+            if normalized in _FALSE_STRINGS:
+                return False
+            raise ValueError(
+                f"Unsupported boolean value for config key '{key}'"
+            )
+        raise ValueError(f"Unsupported boolean value for config key '{key}'")
 
     def set(self, key: str, value: Any) -> None:
         self._set_nested(key, value)

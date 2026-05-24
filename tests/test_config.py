@@ -32,6 +32,54 @@ class TestConfig:
         assert data["key1"] == "value1"
         assert data["key2"] == "value2"
 
+    def test_get_bool_parses_supported_values(self):
+        config = Config()
+        config.set("features.enabled", True)
+        config.set("features.disabled", "false")
+        config.set("features.retry", "YES")
+        config.set("features.tracing", " off ")
+        config.set("features.metrics", 1)
+        config.set("features.audit", 0)
+
+        assert config.get_bool("features.enabled") is True
+        assert config.get_bool("features.disabled") is False
+        assert config.get_bool("features.retry") is True
+        assert config.get_bool("features.tracing") is False
+        assert config.get_bool("features.metrics") is True
+        assert config.get_bool("features.audit") is False
+
+    def test_get_bool_preserves_missing_default(self):
+        config = Config()
+        assert config.get_bool("features.missing", default=False) is False
+        assert config.get_bool("features.missing", default=True) is True
+
+    def test_get_bool_rejects_unsupported_strings(self):
+        config = Config()
+        config.set("features.flag", "sometimes")
+
+        with pytest.raises(ValueError, match="features.flag"):
+            config.get_bool("features.flag")
+
+    def test_get_bool_rejects_ambiguous_non_bool_values(self):
+        config = Config()
+        config.set("features.count", 2)
+        config.set("features.list", ["true"])
+
+        with pytest.raises(ValueError, match="features.count"):
+            config.get_bool("features.count")
+        with pytest.raises(ValueError, match="features.list"):
+            config.get_bool("features.list")
+
+    def test_get_bool_reads_environment_overrides(self, monkeypatch):
+        monkeypatch.setenv("AO_FEATURES_ENABLED", "false")
+        monkeypatch.setenv("AO_FEATURES_REQUIRE_AUTH", "on")
+
+        config = Config()
+
+        assert config.get("features.enabled") == "false"
+        assert config.get_bool("features.enabled") is False
+        assert config.get_bool("features.require.auth") is True
+
 # 2019-02-01T18:58:35 update
 
 # 2019-07-31T13:45:15 update
