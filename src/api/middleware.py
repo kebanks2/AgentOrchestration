@@ -1,18 +1,96 @@
 """API middleware components."""
 
-import time
+import contextvars
 import logging
+import re
+import time
+import uuid
 from typing import Callable
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
+from starlette.responses import PlainTextResponse
 from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
+_request_id_var = contextvars.ContextVar("request_id", default="-")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+REQUEST_ID_HEADER = "X-Request-ID"
+
+
+def get_request_id() -> str:
+    return _request_id_var.get()
+
+
+def _sanitize_request_id(value: str) -> str:
+    if value and _REQUEST_ID_RE.fullmatch(value.strip()):
+        return value.strip()
+    return uuid.uuid4().hex
+
+
+class RequestIDLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = get_request_id()
+        return True
+
+
+def _install_request_id_filters() -> None:
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if getattr(handler, "_ao_request_id_filter", False):
+            continue
+        handler.addFilter(RequestIDLogFilter())
+        handler._ao_request_id_filter = True
+
+
+class RequestIDMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = _request_id_from_scope(scope)
+        token = _request_id_var.set(request_id)
+        _install_request_id_filters()
+
+        async def send_with_request_id(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers[REQUEST_ID_HEADER] = request_id
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_request_id)
+        except Exception:
+            logger.exception("Unhandled request error")
+            response = PlainTextResponse(
+                "Internal Server Error",
+                status_code=500,
+                headers={REQUEST_ID_HEADER: request_id},
+            )
+            await response(scope, receive, send)
+        finally:
+            _request_id_var.reset(token)
+
+
+def _request_id_from_scope(scope: Scope) -> str:
+    headers = MutableHeaders(scope=scope)
+    return _sanitize_request_id(headers.get(REQUEST_ID_HEADER, ""))
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
-        if request.url.path.startswith("/api/v2") and request.url.path != "/api/v2/auth/token":
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
+        if (
+            request.url.path.startswith("/api/v2")
+            and request.url.path != "/api/v2/auth/token"
+        ):
             token = request.headers.get("Authorization", "")
             if not token.startswith("Bearer "):
                 return Response(status_code=401, content="Unauthorized")
@@ -26,14 +104,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.window = window
         self._requests = {}
 
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         client_ip = request.client.host if request.client else "unknown"
         now = time.time()
 
         if client_ip not in self._requests:
             self._requests[client_ip] = []
 
-        self._requests[client_ip] = [t for t in self._requests[client_ip] if now - t < self.window]
+        self._requests[client_ip] = [
+            t for t in self._requests[client_ip] if now - t < self.window
+        ]
 
         if len(self._requests[client_ip]) >= self.max_requests:
             return Response(status_code=429, content="Too many requests")
@@ -43,11 +125,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 
 class LoggingMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+    async def dispatch(
+        self, request: Request, call_next: Callable
+    ) -> Response:
         start = time.time()
         response = await call_next(request)
         duration = time.time() - start
-        logger.info(f"{request.method} {request.url.path} {response.status_code} {duration:.3f}s")
+        logger.info(
+            "%s %s %s %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration,
+        )
         return response
 
 # 2019-03-01T18:35:19 update
