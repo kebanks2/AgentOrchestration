@@ -1,22 +1,42 @@
 """API route definitions."""
 
-from fastapi import APIRouter, HTTPException, Depends
-from typing import List, Dict, Optional
+from fastapi import APIRouter, Header, HTTPException, Request
+from typing import Dict, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.api.webhooks import (
+    WebhookSubscription,
+    WebhookVerificationError,
+    WebhookVerifier,
+)
 
 router = APIRouter()
 registry = AgentRegistry()
+webhook_verifier = WebhookVerifier()
+webhook_subscriptions = {}
+
+
+def register_webhook_subscription(subscription: WebhookSubscription) -> None:
+    webhook_subscriptions[
+        (subscription.workspace_id, subscription.endpoint_id)
+    ] = subscription
 
 
 @router.get("/agents")
-async def list_agents(status: Optional[str] = None, group: Optional[str] = None):
+async def list_agents(
+    status: Optional[str] = None,
+    group: Optional[str] = None,
+):
     status_filter = AgentStatus(status) if status else None
     return {"agents": registry.list(status=status_filter, group=group)}
 
 
 @router.post("/agents")
-async def register_agent(name: str, agent_type: str, config: Optional[Dict] = None):
+async def register_agent(
+    name: str,
+    agent_type: str,
+    config: Optional[Dict] = None,
+):
     agent_id = registry.register(name, agent_type, config)
     return {"agent_id": agent_id, "status": "registered"}
 
@@ -53,6 +73,45 @@ async def stop_agent(agent_id: str):
 @router.get("/agents/count")
 async def agent_count():
     return {"count": registry.count()}
+
+
+@router.post("/webhooks/{workspace_id}/{endpoint_id}/events")
+async def receive_webhook_event(
+    workspace_id: str,
+    endpoint_id: str,
+    request: Request,
+    x_ao_delivery_id: str = Header(...),
+    x_ao_signature: str = Header(...),
+    x_ao_timestamp: str = Header(...),
+):
+    subscription = webhook_subscriptions.get((workspace_id, endpoint_id))
+    if not subscription:
+        raise HTTPException(
+            status_code=404,
+            detail="Webhook endpoint not found",
+        )
+
+    body = await request.body()
+    try:
+        record = webhook_verifier.verify(
+            subscription,
+            body,
+            {
+                "X-AO-Delivery-ID": x_ao_delivery_id,
+                "X-AO-Signature": x_ao_signature,
+                "X-AO-Timestamp": x_ao_timestamp,
+            },
+        )
+    except WebhookVerificationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "status": "duplicate" if record.duplicate else "accepted",
+        "delivery_id": record.delivery_id,
+        "idempotency_key": record.idempotency_key,
+        "workspace_id": record.workspace_id,
+        "endpoint_id": record.endpoint_id,
+    }
 
 # 2019-03-18T11:10:18 update
 
