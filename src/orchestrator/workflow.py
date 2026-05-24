@@ -1,8 +1,11 @@
 """Workflow Manager — Defines and executes multi-step agent workflows."""
 
+import logging
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 class StepStatus(Enum):
@@ -11,10 +14,17 @@ class StepStatus(Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class WorkflowStep:
-    def __init__(self, name: str, handler: Callable, retries: int = 0, timeout: int = 300):
+    def __init__(
+        self,
+        name: str,
+        handler: Callable,
+        retries: int = 0,
+        timeout: int = 300,
+    ):
         self.id = str(uuid4())
         self.name = name
         self.handler = handler
@@ -23,6 +33,7 @@ class WorkflowStep:
         self.status = StepStatus.PENDING
         self.result: Any = None
         self.error: Optional[str] = None
+        self.attempt = 0
 
 
 class Workflow:
@@ -33,6 +44,7 @@ class Workflow:
         self.steps: List[WorkflowStep] = []
         self._step_map: Dict[str, WorkflowStep] = {}
         self.status = StepStatus.PENDING
+        self.revision = 0
 
     def add_step(self, step: WorkflowStep) -> "Workflow":
         self.steps.append(step)
@@ -46,6 +58,7 @@ class Workflow:
 class WorkflowManager:
     def __init__(self):
         self._workflows: Dict[str, Workflow] = {}
+        self._audit_records: List[Dict[str, Any]] = []
 
     def create_workflow(self, name: str, description: str = "") -> Workflow:
         workflow = Workflow(name, description)
@@ -61,26 +74,126 @@ class WorkflowManager:
     def delete_workflow(self, workflow_id: str) -> bool:
         return self._workflows.pop(workflow_id, None) is not None
 
+    def cancel_workflow(self, workflow_id: str) -> bool:
+        workflow = self._workflows.get(workflow_id)
+        if not workflow:
+            return False
+        if workflow.status == StepStatus.CANCELLED:
+            return True
+
+        workflow.status = StepStatus.CANCELLED
+        workflow.revision += 1
+        for step in workflow.steps:
+            if step.status != StepStatus.COMPLETED:
+                step.status = StepStatus.CANCELLED
+        self._record_audit(workflow, "workflow_cancelled")
+        return True
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
     def execute_workflow(self, workflow_id: str) -> bool:
         workflow = self._workflows.get(workflow_id)
         if not workflow:
             return False
+        if workflow.status == StepStatus.CANCELLED:
+            self._record_audit(
+                workflow,
+                "cancelled_workflow_dispatch_rejected",
+            )
+            return False
 
         workflow.status = StepStatus.RUNNING
+        workflow.revision += 1
         for step in workflow.steps:
-            step.status = StepStatus.RUNNING
-            try:
-                result = step.handler()
-                step.result = result
-                step.status = StepStatus.COMPLETED
-            except Exception as e:
-                step.error = str(e)
-                step.status = StepStatus.FAILED
-                workflow.status = StepStatus.FAILED
+            if workflow.status == StepStatus.CANCELLED:
+                self._record_audit(
+                    workflow,
+                    "cancelled_parent_step_deferred",
+                    step,
+                )
+                return False
+            if step.status == StepStatus.CANCELLED:
+                self._record_audit(
+                    workflow,
+                    "cancelled_step_dispatch_rejected",
+                    step,
+                )
                 return False
 
+            step.status = StepStatus.RUNNING
+            for attempt in range(step.retries + 1):
+                if workflow.status == StepStatus.CANCELLED:
+                    step.status = StepStatus.CANCELLED
+                    self._record_audit(
+                        workflow,
+                        "cancelled_parent_retry_rejected",
+                        step,
+                    )
+                    return False
+
+                step.attempt = attempt
+                try:
+                    result = step.handler()
+                    if workflow.status == StepStatus.CANCELLED:
+                        step.result = None
+                        step.error = None
+                        step.status = StepStatus.CANCELLED
+                        self._record_audit(
+                            workflow,
+                            "cancelled_parent_completion_rejected",
+                            step,
+                        )
+                        return False
+                    step.result = result
+                    step.error = None
+                    step.status = StepStatus.COMPLETED
+                    break
+                except Exception as e:
+                    if workflow.status == StepStatus.CANCELLED:
+                        step.error = None
+                        step.status = StepStatus.CANCELLED
+                        self._record_audit(
+                            workflow,
+                            "cancelled_parent_retry_rejected",
+                            step,
+                        )
+                        return False
+                    step.error = str(e)
+                    if attempt >= step.retries:
+                        step.status = StepStatus.FAILED
+                        workflow.status = StepStatus.FAILED
+                        workflow.revision += 1
+                        self._record_audit(workflow, "step_failed", step)
+                        return False
+                    self._record_audit(workflow, "step_retry_scheduled", step)
+
         workflow.status = StepStatus.COMPLETED
+        workflow.revision += 1
         return True
+
+    def _record_audit(
+        self,
+        workflow: Workflow,
+        event: str,
+        step: Optional[WorkflowStep] = None,
+    ) -> None:
+        record = {
+            "event": event,
+            "workflow_id": workflow.id,
+            "workflow_status": workflow.status.value,
+            "revision": workflow.revision,
+        }
+        if step:
+            record.update(
+                {
+                    "step_id": step.id,
+                    "step_status": step.status.value,
+                    "attempt": step.attempt,
+                }
+            )
+        self._audit_records.append(record)
+        logger.info("workflow transition audit: %s", record)
 
 # 2019-03-27T19:58:07 update
 
