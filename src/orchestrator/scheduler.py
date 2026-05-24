@@ -1,10 +1,32 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+
+
+class WorkerProtocolError(ValueError):
+    """Raised when worker protocol timeout settings are unsafe."""
+
+
+@dataclass(frozen=True)
+class WorkerProtocolSettings:
+    """Timeout contract for worker claim, visibility, and acknowledgement."""
+
+    ack_timeout: float = 30.0
+    visibility_timeout: float = 10.0
+
+    def __post_init__(self) -> None:
+        if self.visibility_timeout <= 0:
+            raise WorkerProtocolError(
+                "visibility_timeout must be greater than zero"
+            )
+        if self.ack_timeout <= self.visibility_timeout:
+            raise WorkerProtocolError(
+                "ack_timeout must exceed visibility_timeout"
+            )
 
 
 class PriorityQueue:
@@ -31,30 +53,55 @@ class PriorityQueue:
 
 
 class TaskScheduler:
-    def __init__(self):
+    def __init__(
+        self,
+        worker_protocol: Optional[WorkerProtocolSettings] = None,
+    ):
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._audit_records: List[Dict[str, Any]] = []
+        self._worker_protocol = worker_protocol or WorkerProtocolSettings()
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        task_protocol = self._task_protocol_settings(task)
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
-        task["enqueued_at"] = time.time()
-        task["retries"] = 0
+        task["enqueued_at"] = task.get("enqueued_at", time.time())
+        task["retries"] = task.get("retries", 0)
+        task["priority"] = priority
+        task["ack_timeout"] = task_protocol.ack_timeout
+        task["visibility_timeout"] = task_protocol.visibility_timeout
 
         if queue not in self._queues:
             self._queues[queue] = PriorityQueue()
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
-        task_id = str(uuid4())
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
+        self._task_protocol_settings(task)
+        task_id = task.get("id") or str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -75,11 +122,60 @@ class TaskScheduler:
     def fail(self, task_id: str, queue: str = "default") -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
+            try:
+                self._task_protocol_settings(task)
+            except WorkerProtocolError as exc:
+                self._record_protocol_rejection(
+                    task,
+                    "retry_rejected",
+                    str(exc),
+                )
+                return False
+
             task["retries"] += 1
             if task["retries"] < self._max_retries:
                 self.enqueue(task, queue, priority=task.get("priority", 0))
                 return True
         return False
+
+    def audit_records(self) -> List[Dict[str, Any]]:
+        return [record.copy() for record in self._audit_records]
+
+    def _task_protocol_settings(self, task: Dict) -> WorkerProtocolSettings:
+        try:
+            ack_timeout = float(
+                task.get("ack_timeout", self._worker_protocol.ack_timeout)
+            )
+            visibility_timeout = float(
+                task.get(
+                    "visibility_timeout",
+                    self._worker_protocol.visibility_timeout,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise WorkerProtocolError(
+                "worker protocol timeouts must be numeric"
+            ) from exc
+        return WorkerProtocolSettings(
+            ack_timeout=ack_timeout,
+            visibility_timeout=visibility_timeout,
+        )
+
+    def _record_protocol_rejection(
+        self,
+        task: Dict,
+        event: str,
+        reason: str,
+    ) -> None:
+        self._audit_records.append(
+            {
+                "event": event,
+                "task_id": task.get("id"),
+                "ack_timeout": task.get("ack_timeout"),
+                "visibility_timeout": task.get("visibility_timeout"),
+                "reason": reason,
+            }
+        )
 
 # 2019-04-25T08:37:12 update
 
