@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 ao = "src.cli.main:cli"
+ao-runner-provenance = "src.ci.runner_provenance:main"
 
 [tool.uv]
 dev-dependencies = [
