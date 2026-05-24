@@ -1,4 +1,3 @@
-import pytest
 from src.orchestrator.scheduler import TaskScheduler
 
 
@@ -35,6 +34,82 @@ class TestTaskScheduler:
         import asyncio
         task = asyncio.run(self.scheduler.dequeue())
         assert self.scheduler.fail(task["id"])
+
+    def test_dependency_outage_defers_before_dispatch(self):
+        self.scheduler.set_dependency_health(
+            "vector-db",
+            False,
+            reason="maintenance window with private host payload",
+        )
+        task_id = self.scheduler.enqueue({
+            "type": "embedding",
+            "required_services": ["vector-db"],
+            "payload": {"private_host": "internal.example"},
+        })
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.deferred_count() == 1
+
+        audit = self.scheduler.audit_records()
+        assert audit[-1]["action"] == "defer"
+        assert audit[-1]["task_id"] == task_id
+        assert audit[-1]["dependencies"] == ["vector-db"]
+        assert "internal.example" not in str(audit)
+
+    def test_deferred_task_releases_when_dependency_recovers(self):
+        self.scheduler.set_dependency_health("redis", False)
+        task_id = self.scheduler.enqueue({
+            "type": "agent-run",
+            "external_services": ["redis"],
+        })
+
+        self.scheduler.set_dependency_health("redis", True)
+
+        import asyncio
+        task = asyncio.run(self.scheduler.dequeue())
+        assert task["id"] == task_id
+        assert task["scheduler_state"] == "ready"
+        assert self.scheduler.deferred_count() == 0
+
+    def test_due_scheduled_task_defers_during_outage(self):
+        self.scheduler.set_dependency_health("billing-api", False)
+        task_id = self.scheduler.schedule(
+            {"type": "billing-sync", "required_services": ["billing-api"]},
+            delay=0,
+        )
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.deferred_count() == 1
+
+        audit = self.scheduler.audit_records()
+        assert audit[-1]["task_id"] == task_id
+        assert audit[-1]["decision"] == "deferred during schedule"
+
+    def test_dequeue_rechecks_health_before_dispatch(self):
+        task_id = self.scheduler.enqueue({
+            "type": "search-index",
+            "dependencies": ["search"],
+        })
+        self.scheduler.set_dependency_health("search", False)
+
+        import asyncio
+        assert asyncio.run(self.scheduler.dequeue()) is None
+        assert self.scheduler.deferred_count() == 1
+        assert self.scheduler.in_flight_count() == 0
+        assert task_id in self.scheduler.deferred_task_ids()
+
+    def test_audit_records_are_bounded(self):
+        scheduler = TaskScheduler(audit_limit=2)
+
+        scheduler.set_dependency_health("a", False)
+        scheduler.set_dependency_health("b", False)
+        scheduler.set_dependency_health("c", False)
+
+        audit = scheduler.audit_records()
+        assert len(audit) == 2
+        assert [record["dependencies"][0] for record in audit] == ["b", "c"]
 
 # 2019-01-09T19:07:03 update
 
