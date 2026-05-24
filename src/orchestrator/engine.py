@@ -3,9 +3,10 @@
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from src.agent import AgentRegistry, AgentStatus
+from src.orchestrator.event_bus import RunEventBus
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ class OrchestrationEngine:
     def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.event_bus = RunEventBus()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -47,10 +49,18 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
-        for hook in self._hooks["pre_execute"]:
-            await hook(task)
+        await self.event_bus.publish(
+            task_id,
+            sequence=1,
+            event_type="task_started",
+            payload={"agent_id": agent_id},
+            producer="engine",
+        )
 
         try:
+            for hook in self._hooks["pre_execute"]:
+                await hook(task)
+
             agent = self.registry.get(agent_id)
             if not agent:
                 raise ValueError(f"Agent {agent_id} not found")
@@ -62,13 +72,41 @@ class OrchestrationEngine:
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
 
+            await self.event_bus.publish(
+                task_id,
+                sequence=2,
+                event_type="task_completed",
+                payload={"agent_id": agent_id},
+                producer="engine",
+                terminal=True,
+            )
+
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
 
             logger.info(f"Task {task_id} completed successfully")
 
+        except asyncio.CancelledError:
+            await self.event_bus.publish(
+                task_id,
+                sequence=2,
+                event_type="task_cancelled",
+                payload={"agent_id": agent_id},
+                producer="engine",
+                terminal=True,
+            )
+            raise
+
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            await self.event_bus.publish(
+                task_id,
+                sequence=2,
+                event_type="task_failed",
+                payload={"agent_id": agent_id, "error": type(e).__name__},
+                producer="engine",
+                terminal=True,
+            )
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +120,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
