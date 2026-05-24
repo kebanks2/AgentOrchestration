@@ -1,20 +1,60 @@
 """FastAPI application server."""
 
 import os
-from typing import Dict
+from typing import Any, Callable, Dict, Mapping, Optional
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from .routes import router
 from .middleware import AuthMiddleware, RateLimitMiddleware, LoggingMiddleware
 
+VERSION = "2.4.1"
+
+_SENSITIVE_EXECUTION_METADATA = {
+    "agent_id",
+    "api_key",
+    "api_keys",
+    "config",
+    "database_url",
+    "db_url",
+    "debug",
+    "env",
+    "environment",
+    "execution_id",
+    "hostname",
+    "in_flight_tasks",
+    "internal_host",
+    "internal_ip",
+    "local_variables",
+    "pid",
+    "private_ip",
+    "process_id",
+    "raw_payload",
+    "redis_url",
+    "runtime_stats",
+    "sandbox_path",
+    "scheduler_queue",
+    "secret",
+    "secrets",
+    "span_id",
+    "task_payload",
+    "token",
+    "tokens",
+    "trace_id",
+    "worker_pids",
+    "workspace_id",
+}
+
+_TRUTHY_DIAGNOSTIC_FLAGS = {"1", "true", "yes"}
+_FALSY_DIAGNOSTIC_FLAGS = {"0", "false", "no"}
+
 
 def create_app(config: Dict = None) -> FastAPI:
     app = FastAPI(
         title="Agent Orchestrator API",
-        version="2.4.1",
+        version=VERSION,
         description="Enterprise Agent Orchestration Platform API",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
@@ -28,7 +68,10 @@ def create_app(config: Dict = None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","))
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=os.getenv("TRUSTED_HOSTS", "*").split(","),
+    )
 
     app.add_middleware(AuthMiddleware)
     app.add_middleware(RateLimitMiddleware)
@@ -37,10 +80,92 @@ def create_app(config: Dict = None) -> FastAPI:
     app.include_router(router, prefix="/api/v2")
 
     @app.get("/health")
-    async def health():
-        return {"status": "healthy", "version": "2.4.1"}
+    async def health(
+        include_execution_metadata: Optional[str] = Query(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        return build_public_health_response(
+            include_execution_metadata=include_execution_metadata,
+            authorization=authorization,
+        )
 
     return app
+
+
+def build_public_health_response(
+    include_execution_metadata: Optional[str] = None,
+    authorization: Optional[str] = None,
+    metadata_provider: Callable[[], Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a public health response without leaking execution metadata."""
+
+    include_private_metadata = _parse_diagnostics_flag(
+        include_execution_metadata
+    )
+    if include_private_metadata and not _has_bearer_token(authorization):
+        raise HTTPException(
+            status_code=401,
+            detail="execution metadata requires authorization",
+        )
+
+    health: Dict[str, Any] = {"status": "healthy", "version": VERSION}
+    if include_private_metadata:
+        provider = metadata_provider or collect_execution_metadata
+        health["diagnostics"] = provider()
+    return redact_execution_metadata(health)
+
+
+def collect_execution_metadata() -> Dict[str, Any]:
+    """Collect private runtime metadata for authorized diagnostics only."""
+
+    return {
+        "process_id": os.getpid(),
+        "environment": os.getenv("ENVIRONMENT", "development"),
+        "scheduler_queue": "available",
+    }
+
+
+def redact_execution_metadata(value: Any) -> Any:
+    """Recursively remove private execution metadata before serialization."""
+
+    if isinstance(value, list):
+        return [redact_execution_metadata(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    redacted: Dict[str, Any] = {}
+    for key, item in value.items():
+        if _is_sensitive_metadata_key(key):
+            continue
+        redacted[key] = redact_execution_metadata(item)
+    return redacted
+
+
+def _parse_diagnostics_flag(raw_value: Optional[str]) -> bool:
+    if raw_value is None:
+        return False
+    normalized = raw_value.strip().lower()
+    if normalized in _TRUTHY_DIAGNOSTIC_FLAGS:
+        return True
+    if normalized in _FALSY_DIAGNOSTIC_FLAGS:
+        return False
+    raise HTTPException(
+        status_code=400,
+        detail="include_execution_metadata must be true or false",
+    )
+
+
+def _has_bearer_token(authorization: Optional[str]) -> bool:
+    if not authorization:
+        return False
+    scheme, _, token = authorization.partition(" ")
+    return scheme.lower() == "bearer" and bool(token.strip())
+
+
+def _is_sensitive_metadata_key(key: Any) -> bool:
+    if not isinstance(key, str):
+        return False
+    return key.lower() in _SENSITIVE_EXECUTION_METADATA
 
 # 2019-02-28T12:25:15 update
 
