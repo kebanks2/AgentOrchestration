@@ -1,9 +1,14 @@
 """Agent Executor — Handles task execution within agent sandboxes."""
 
 import asyncio
+import json
 import time
 from typing import Any, Callable, Dict, Optional
 from uuid import uuid4
+
+
+class ResultSerializationError(ValueError):
+    """Raised when a task result cannot be emitted as JSON."""
 
 
 class AgentExecutor:
@@ -13,7 +18,9 @@ class AgentExecutor:
         self._active_tasks: Dict[str, asyncio.Task] = {}
         self._results: Dict[str, Any] = {}
 
-    async def execute(self, agent_id: str, task: Dict[str, Any], handler: Callable) -> str:
+    async def execute(
+        self, agent_id: str, task: Dict[str, Any], handler: Callable
+    ) -> str:
         execution_id = str(uuid4())
         async with self._semaphore:
             task_obj = asyncio.create_task(
@@ -22,25 +29,68 @@ class AgentExecutor:
             self._active_tasks[execution_id] = task_obj
             try:
                 result = await task_obj
-                self._results[execution_id] = result
+                self._record_terminal_result(execution_id, result)
+            except asyncio.CancelledError:
+                self._record_terminal_result(
+                    execution_id,
+                    {
+                        "execution_id": execution_id,
+                        "agent_id": agent_id,
+                        "task_id": task.get("id"),
+                        "status": "cancelled",
+                        "error": "execution cancelled",
+                        "timestamp": time.time(),
+                    },
+                )
             except Exception as e:
-                self._results[execution_id] = {"error": str(e)}
+                self._record_terminal_result(
+                    execution_id,
+                    {
+                        "execution_id": execution_id,
+                        "agent_id": agent_id,
+                        "task_id": task.get("id"),
+                        "status": "failed",
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "timestamp": time.time(),
+                    },
+                )
             finally:
                 self._active_tasks.pop(execution_id, None)
         return execution_id
 
-    async def _run_execution(self, exec_id: str, agent_id: str, task: Dict, handler: Callable) -> Any:
+    async def _run_execution(
+        self, exec_id: str, agent_id: str, task: Dict, handler: Callable
+    ) -> Any:
         start = time.time()
         result = await handler(agent_id, task)
         duration = time.time() - start
-        return {
+        payload = {
             "execution_id": exec_id,
             "agent_id": agent_id,
             "task_id": task.get("id"),
+            "status": "completed",
             "result": result,
             "duration": duration,
             "timestamp": time.time(),
         }
+        self._validate_json_result(payload)
+        return payload
+
+    def _record_terminal_result(
+        self, execution_id: str, result: Dict[str, Any]
+    ) -> None:
+        if execution_id not in self._results:
+            self._results[execution_id] = result
+
+    def _validate_json_result(self, payload: Dict[str, Any]) -> None:
+        try:
+            json.dumps(payload)
+        except (TypeError, ValueError) as exc:
+            raise ResultSerializationError(
+                "task result must be JSON serializable before completion "
+                "is recorded"
+            ) from exc
 
     def get_result(self, execution_id: str) -> Optional[Any]:
         return self._results.get(execution_id)
@@ -56,7 +106,9 @@ class AgentExecutor:
         for task in self._active_tasks.values():
             task.cancel()
         if self._active_tasks:
-            await asyncio.gather(*self._active_tasks.values(), return_exceptions=True)
+            await asyncio.gather(
+                *self._active_tasks.values(), return_exceptions=True
+            )
 
 # 2019-01-31T14:19:34 update
 
