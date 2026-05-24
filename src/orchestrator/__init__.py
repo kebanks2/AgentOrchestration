@@ -3,8 +3,22 @@
 from .engine import OrchestrationEngine
 from .scheduler import TaskScheduler
 from .workflow import WorkflowManager
+from .checkpoint import (
+    CheckpointConflictError,
+    CheckpointKey,
+    CheckpointRecord,
+    CheckpointStore,
+)
 
-__all__ = ["OrchestrationEngine", "TaskScheduler", "WorkflowManager"]
+__all__ = [
+    "OrchestrationEngine",
+    "TaskScheduler",
+    "WorkflowManager",
+    "CheckpointConflictError",
+    "CheckpointKey",
+    "CheckpointRecord",
+    "CheckpointStore",
+]
 
 # 2019-07-01T16:04:27 update
 
