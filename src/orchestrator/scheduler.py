@@ -1,6 +1,5 @@
 """Task Scheduler — Priority-based task queuing and dispatch."""
 
-import asyncio
 import heapq
 import time
 from typing import Any, Dict, Optional
@@ -35,9 +34,15 @@ class TaskScheduler:
         self._queues: Dict[str, PriorityQueue] = {}
         self._scheduled: Dict[str, float] = {}
         self._in_flight: Dict[str, Dict] = {}
+        self._terminal: Dict[str, Dict[str, Any]] = {}
         self._max_retries = 3
 
-    def enqueue(self, task: Dict, queue: str = "default", priority: int = 0) -> str:
+    def enqueue(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         task["enqueued_at"] = time.time()
@@ -48,13 +53,33 @@ class TaskScheduler:
         self._queues[queue].push(task, priority)
         return task_id
 
-    def schedule(self, task: Dict, delay: float, queue: str = "default", priority: int = 0) -> str:
+    def _requeue_existing(
+        self,
+        task: Dict,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> None:
+        if queue not in self._queues:
+            self._queues[queue] = PriorityQueue()
+        self._queues[queue].push(task, priority)
+
+    def schedule(
+        self,
+        task: Dict,
+        delay: float,
+        queue: str = "default",
+        priority: int = 0,
+    ) -> str:
         task_id = str(uuid4())
         task["id"] = task_id
         self._scheduled[task_id] = time.time() + delay
         return task_id
 
-    async def dequeue(self, queue: str = "default", timeout: float = 1.0) -> Optional[Dict]:
+    async def dequeue(
+        self,
+        queue: str = "default",
+        timeout: float = 1.0,
+    ) -> Optional[Dict]:
         now = time.time()
         expired = [tid for tid, t in self._scheduled.items() if t <= now]
         for tid in expired:
@@ -69,17 +94,55 @@ class TaskScheduler:
                 return task
         return None
 
-    def complete(self, task_id: str) -> bool:
-        return self._in_flight.pop(task_id, None) is not None
+    def terminal_outcome(self, task_id: str) -> Optional[Dict[str, Any]]:
+        return self._terminal.get(task_id)
 
-    def fail(self, task_id: str, queue: str = "default") -> bool:
+    def record_terminal(
+        self,
+        task_id: str,
+        status: str,
+        reason: str = "",
+        result: Any = None,
+    ) -> bool:
+        self._in_flight.pop(task_id, None)
+        if task_id in self._terminal:
+            return False
+        self._terminal[task_id] = {
+            "task_id": task_id,
+            "status": status,
+            "reason": reason,
+            "result": result,
+            "recorded_at": time.time(),
+        }
+        return True
+
+    def complete(self, task_id: str, result: Any = None) -> bool:
+        if task_id in self._terminal:
+            return False
+        return self.record_terminal(task_id, "completed", result=result)
+
+    def fail(
+        self,
+        task_id: str,
+        queue: str = "default",
+        reason: str = "",
+    ) -> bool:
         task = self._in_flight.pop(task_id, None)
         if task:
             task["retries"] += 1
             if task["retries"] < self._max_retries:
-                self.enqueue(task, queue, priority=task.get("priority", 0))
+                self._requeue_existing(
+                    task,
+                    queue,
+                    priority=task.get("priority", 0),
+                )
                 return True
+            self.record_terminal(task_id, "failed", reason=reason)
+            return True
         return False
+
+    def fail_closed(self, task_id: str, reason: str) -> bool:
+        return self.record_terminal(task_id, "failed", reason=reason)
 
 # 2019-04-25T08:37:12 update
 

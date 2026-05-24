@@ -6,15 +6,22 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional
 
 from src.agent import AgentRegistry, AgentStatus
+from src.common.policy import PolicyRuntime
 from src.orchestrator.scheduler import TaskScheduler
 
 logger = logging.getLogger(__name__)
 
 
 class OrchestrationEngine:
-    def __init__(self, max_workers: int = 10, agent_timeout: int = 300):
+    def __init__(
+        self,
+        max_workers: int = 10,
+        agent_timeout: int = 300,
+        policy_runtime: Optional[PolicyRuntime] = None,
+    ):
         self.registry = AgentRegistry()
         self.scheduler = TaskScheduler()
+        self.policy_runtime = policy_runtime or PolicyRuntime()
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         self.agent_timeout = agent_timeout
         self._running = False
@@ -47,6 +54,21 @@ class OrchestrationEngine:
         agent_id = task["target_agent"]
         logger.info(f"Executing task {task_id} on agent {agent_id}")
 
+        if self.scheduler.terminal_outcome(task_id):
+            logger.warning("Skipping terminal task %s", task_id)
+            return
+
+        decision = self.policy_runtime.authorize_task(task)
+        if not decision.allowed:
+            error = RuntimeError(
+                f"Task {task_id} denied by policy: {decision.reason}"
+            )
+            self.scheduler.fail_closed(task_id, decision.reason)
+            logger.error(str(error))
+            for hook in self._hooks["on_error"]:
+                await hook(task, error)
+            return
+
         for hook in self._hooks["pre_execute"]:
             await hook(task)
 
@@ -61,6 +83,7 @@ class OrchestrationEngine:
                 timeout=self.agent_timeout,
             )
             self.registry.update_status(agent_id, AgentStatus.PAUSED)
+            self.scheduler.complete(task_id, result=result)
 
             for hook in self._hooks["post_execute"]:
                 await hook(task, result)
@@ -69,6 +92,11 @@ class OrchestrationEngine:
 
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}")
+            self.scheduler.fail(task_id, reason=str(e))
+            if self.scheduler.terminal_outcome(task_id):
+                self.registry.update_status(agent_id, AgentStatus.FAILED)
+            else:
+                self.registry.update_status(agent_id, AgentStatus.PAUSED)
             for hook in self._hooks["on_error"]:
                 await hook(task, e)
 
@@ -82,7 +110,10 @@ class OrchestrationEngine:
         )
 
     def _execute_in_thread(self, agent: Dict, task: Dict) -> Any:
-        return {"status": "completed", "output": f"Task {task['id']} processed by {agent['name']}"}
+        return {
+            "status": "completed",
+            "output": f"Task {task['id']} processed by {agent['name']}",
+        }
 
 # 2019-04-24T14:55:39 update
 
