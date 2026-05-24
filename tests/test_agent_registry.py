@@ -1,4 +1,3 @@
-import pytest
 from src.agent.registry import AgentRegistry, AgentStatus
 
 
@@ -47,6 +46,65 @@ class TestAgentRegistry:
 
     def test_delete_nonexistent_agent(self):
         assert not self.registry.delete("nonexistent-id")
+
+    def test_resolve_caches_active_agent_lookup(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        agent = self.registry.resolve(
+            agent_id,
+            required_type="worker.processor",
+        )
+
+        assert agent is not None
+        assert agent["id"] == agent_id
+        assert self.registry.cache_size() == 1
+
+    def test_status_update_invalidates_cached_lookup(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.resolve(agent_id) is not None
+
+        assert self.registry.update_status(agent_id, AgentStatus.STOPPED)
+
+        assert self.registry.cache_size() == 0
+        assert self.registry.resolve(agent_id) is None
+        assert self.registry.get(agent_id)["status"] == "stopped"
+
+    def test_delete_invalidates_cached_lookup(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+        assert self.registry.resolve(agent_id) is not None
+
+        assert self.registry.delete(agent_id)
+
+        assert self.registry.cache_size() == 0
+        assert self.registry.resolve(agent_id) is None
+
+    def test_resolve_rejects_required_type_mismatch(self):
+        agent_id = self.registry.register("test-agent", "worker.processor")
+
+        assert self.registry.resolve(
+            agent_id,
+            required_type="monitor.watcher",
+        ) is None
+
+    def test_resolve_records_sanitized_audit_decision(self):
+        agent_id = self.registry.register(
+            "test-agent",
+            "worker.processor",
+            config={"token": "not-recorded"},
+        )
+
+        self.registry.resolve(agent_id)
+        self.registry.update_status(agent_id, AgentStatus.TERMINATED)
+        self.registry.resolve(agent_id)
+
+        audit_log = self.registry.get_recent_audit_decisions()
+        assert audit_log[-1] == {
+            "timestamp": audit_log[-1]["timestamp"],
+            "agent_id": agent_id,
+            "action": "resolve",
+            "decision": "rejected",
+        }
+        assert "token" not in str(audit_log)
 
 # 2019-01-23T10:28:57 update
 
